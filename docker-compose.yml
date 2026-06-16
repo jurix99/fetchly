@@ -4,7 +4,7 @@ services:
     image: fetchly:local
     container_name: fetchly
     ports:
-      - "8000:8000"
+      - "6776:6776"
     volumes:
       # Downloaded videos appear in ./downloads on your host machine.
       - ./downloads:/downloads

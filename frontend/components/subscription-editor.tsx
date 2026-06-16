@@ -32,6 +32,7 @@ export function SubscriptionEditor({
   const [interval, setInterval] = useState(6)
   const [quality, setQuality] = useState("Auto")
   const [format, setFormat] = useState("MP4")
+  const [dateAfter, setDateAfter] = useState("")
   const [filters, setFilters] = useState<SubscriptionFilters>({
     excludeShorts: false,
     excludeLives: false,
@@ -44,6 +45,7 @@ export function SubscriptionEditor({
     setInterval(subscription.checkIntervalHours)
     setQuality(subscription.defaultQuality)
     setFormat(subscription.defaultFormat)
+    setDateAfter(subscription.dateAfter ?? "")
     setFilters(subscription.filters)
   }, [subscription])
 
@@ -57,6 +59,7 @@ export function SubscriptionEditor({
       checkIntervalHours: interval,
       defaultQuality: quality,
       defaultFormat: format,
+      dateAfter,
       filters,
     })
     onOpenChange(false)
@@ -99,6 +102,24 @@ export function SubscriptionEditor({
             <QualitySelect value={quality} onChange={setQuality} size="sm" />
             <span className="text-sm">Format</span>
             <FormatSelect value={format} onChange={setFormat} size="sm" />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Label>Télécharger à partir du (laisser vide = tout)</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                type="date"
+                value={dateAfter}
+                max={new Date().toISOString().slice(0, 10)}
+                onChange={(e) => setDateAfter(e.target.value)}
+                className="w-48"
+              />
+              {dateAfter && (
+                <Button variant="ghost" size="sm" onClick={() => setDateAfter("")}>
+                  Effacer
+                </Button>
+              )}
+            </div>
           </div>
 
           <Separator />

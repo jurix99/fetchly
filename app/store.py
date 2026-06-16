@@ -26,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "default_quality": "1080",
     "watch_interval_minutes": 30,
     "organize": "playlist",
+    "max_concurrent": 3,  # how many videos a backfill downloads in parallel
     "watches": [],
 }
 
@@ -60,6 +61,7 @@ def get_settings() -> dict[str, Any]:
         "default_quality": cfg["default_quality"],
         "watch_interval_minutes": cfg["watch_interval_minutes"],
         "organize": cfg["organize"],
+        "max_concurrent": cfg.get("max_concurrent", 3),
     }
 
 
@@ -67,6 +69,7 @@ def update_settings(
     default_quality: str | None = None,
     watch_interval_minutes: int | None = None,
     organize: str | None = None,
+    max_concurrent: int | None = None,
 ) -> dict[str, Any]:
     with _LOCK:
         cfg = _read()
@@ -76,6 +79,8 @@ def update_settings(
             cfg["watch_interval_minutes"] = max(1, int(watch_interval_minutes))
         if organize in ("uploader", "playlist", "flat"):
             cfg["organize"] = organize
+        if max_concurrent is not None:
+            cfg["max_concurrent"] = max(1, min(int(max_concurrent), 10))
         _write(cfg)
         return cfg
 
@@ -90,6 +95,8 @@ def add_watch(
     backfill: bool = True,
     subfolder: str = "",
     date_after: str = "",
+    title: str = "",
+    thumbnail: str = "",
 ) -> dict[str, Any]:
     with _LOCK:
         cfg = _read()
@@ -99,7 +106,8 @@ def add_watch(
             "quality": quality,  # None -> resolve to default at check time
             "subfolder": subfolder,  # optional destination folder under /downloads
             "date_after": date_after,  # ISO date; only sync newer uploads
-            "title": "",
+            "title": title,  # known channel name (refreshed on first sync)
+            "thumbnail": thumbnail,  # known channel avatar (refreshed on sync)
             "enabled": True,
             "backfill": bool(backfill),
             "seeded": False,

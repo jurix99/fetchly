@@ -18,6 +18,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
 import { SubscriptionEditor } from "@/components/subscription-editor"
@@ -31,8 +32,13 @@ function timeAgo(iso: string) {
 }
 
 export function SubscriptionsPanel() {
-  const { subscriptions, toggleSubscription, checkSubscriptionNow, removeSubscription } =
-    useStore()
+  const {
+    subscriptions,
+    watchProgress,
+    toggleSubscription,
+    checkSubscriptionNow,
+    removeSubscription,
+  } = useStore()
   const [editing, setEditing] = useState<Subscription | null>(null)
 
   if (subscriptions.length === 0) {
@@ -54,7 +60,9 @@ export function SubscriptionsPanel() {
 
   return (
     <div className="flex flex-col gap-3">
-      {subscriptions.map((sub) => (
+      {subscriptions.map((sub) => {
+        const prog = watchProgress[sub.id]
+        return (
         <Card key={sub.id} className={cn(!sub.active && "opacity-70")}>
           <CardContent className="flex flex-col gap-4">
             <div className="flex items-start gap-3">
@@ -93,6 +101,36 @@ export function SubscriptionsPanel() {
                 />
               </div>
             </div>
+
+            {/* Backfill/sync state (watch jobs are hidden from the Téléchargements
+                tab, so surface them here). Only call it a "download" when a video
+                is actually downloading — otherwise it's just checking. */}
+            {prog && prog.downloading ? (
+              <div className="flex flex-col gap-1 rounded-md border border-info/30 bg-info/5 p-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="flex items-center gap-1.5 text-info">
+                    <RefreshCwIcon className="size-3.5 animate-spin" />
+                    Téléchargement en cours
+                  </span>
+                  {prog.total > 1 && (
+                    <span className="tabular-nums text-muted-foreground">
+                      {prog.completed}/{prog.total}
+                    </span>
+                  )}
+                </div>
+                <Progress value={prog.percent} />
+                {prog.currentTitle && (
+                  <span className="truncate text-[11px] text-muted-foreground">
+                    {prog.currentTitle}
+                  </span>
+                )}
+              </div>
+            ) : prog && prog.active ? (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <RefreshCwIcon className="size-3.5 animate-spin" />
+                Vérification en cours…
+              </div>
+            ) : null}
 
             {/* Filters summary */}
             <div className="flex flex-wrap gap-1.5">
@@ -145,7 +183,8 @@ export function SubscriptionsPanel() {
             </div>
           </CardContent>
         </Card>
-      ))}
+        )
+      })}
 
       <SubscriptionEditor
         subscription={editing}

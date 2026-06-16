@@ -14,9 +14,12 @@ export interface BackendJob {
   completed: number
   downloaded: number
   current_title: string
+  current_thumbnail?: string
   current_percent: number
   current_speed: string
   files: string[]
+  playlist_title?: string
+  watch_id?: string | null
   created_at: number
 }
 
@@ -27,6 +30,7 @@ export interface BackendWatch {
   subfolder?: string
   date_after?: string
   title: string
+  thumbnail?: string | null
   enabled: boolean
   backfill: boolean
   synced?: number
@@ -39,6 +43,7 @@ export interface BackendSettings {
   default_quality: string
   watch_interval_minutes: number
   organize: string
+  max_concurrent: number
   download_dir: string
   qualities: string[]
 }
@@ -66,8 +71,25 @@ export interface ExtractedVideo {
 export interface ExtractResult extends ExtractedVideo {
   kind: "video" | "playlist"
   uploader?: string
+  avatar?: string
   count?: number
   videos?: ExtractedVideo[]
+  error?: string
+}
+
+export interface SearchResult {
+  query: string
+  videos: ExtractedVideo[]
+  channels: { name: string; url: string }[]
+  error?: string
+}
+
+export interface ChannelInfoResult {
+  name: string
+  avatar: string
+  url: string
+  subscribers?: number | null
+  count?: number | null
   error?: string
 }
 
@@ -85,6 +107,8 @@ export const backend = {
   download: (b: { url: string; quality: string; format: string; subfolder?: string }) =>
     call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
   extract: (url: string) => call<ExtractResult>("POST", "/api/extract", { url }),
+  channelInfo: (url: string) => call<ChannelInfoResult>("POST", "/api/channel", { url }),
+  search: (query: string) => call<SearchResult>("POST", "/api/search", { query }),
   watches: () => call<BackendWatch[]>("GET", "/api/watches"),
   addWatch: (b: {
     url: string
@@ -92,14 +116,24 @@ export const backend = {
     backfill: boolean
     subfolder: string
     date_after: string
+    title?: string
+    thumbnail?: string
   }) => call<BackendWatch & { error?: string }>("POST", "/api/watches", b),
-  patchWatch: (id: string, b: Partial<{ enabled: boolean; quality: string; subfolder: string }>) =>
-    call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
+  patchWatch: (
+    id: string,
+    b: Partial<{ enabled: boolean; quality: string; subfolder: string; date_after: string }>,
+  ) => call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
   removeWatch: (id: string) => call<{ removed: boolean }>("DELETE", `/api/watches/${id}`),
   checkWatch: (id: string) => call<{ status: string }>("POST", `/api/watches/${id}/check`),
   settings: () => call<BackendSettings>("GET", "/api/settings"),
-  saveSettings: (b: Partial<{ default_quality: string; watch_interval_minutes: number; organize: string }>) =>
-    call<BackendSettings>("POST", "/api/settings", b),
+  saveSettings: (
+    b: Partial<{
+      default_quality: string
+      watch_interval_minutes: number
+      organize: string
+      max_concurrent: number
+    }>,
+  ) => call<BackendSettings>("POST", "/api/settings", b),
   files: () => call<BackendFile[]>("GET", "/api/files"),
 }
 

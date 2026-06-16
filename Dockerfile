@@ -40,6 +40,6 @@ COPY --from=frontend /frontend/out ./app/web
 RUN mkdir -p /downloads /config
 VOLUME ["/downloads", "/config"]
 
-EXPOSE 8000
+EXPOSE 6776
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "6776"]
