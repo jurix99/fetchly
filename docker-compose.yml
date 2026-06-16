@@ -1,0 +1,28 @@
+services:
+  fetchly:
+    build: .
+    image: fetchly:local
+    container_name: fetchly
+    ports:
+      - "8000:8000"
+    volumes:
+      # Downloaded videos appear in ./downloads on your host machine.
+      - ./downloads:/downloads
+      # Optional: put a cookies.txt here to get past YouTube's bot check.
+      # The file is read-only inside the container.
+      - ./cookies:/cookies:ro
+      # Settings, watch list and the download archive (so they survive restarts).
+      - ./config:/config
+    environment:
+      # Where to reach the PO-token provider (the sidecar service below).
+      - POT_PROVIDER_URL=http://bgutil-provider:4416
+    depends_on:
+      - bgutil-provider
+    restart: unless-stopped
+
+  # Generates YouTube PO tokens that yt-dlp needs to access many videos.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    init: true
+    restart: unless-stopped

@@ -1,0 +1,41 @@
+# ---- Runtime data (don't commit downloaded media or personal state) ----
+downloads/
+config/
+
+# ---- Secrets ----
+# Keep the folder + its README, but never commit the actual cookies/env.
+cookies/*
+!cookies/README.txt
+.env
+.env*.local
+
+# ---- Python backend ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# ---- Built frontend (generated) ----
+app/web/
+
+# ---- Next.js / Node (frontend/) ----
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ---- v0 sandbox internal files ----
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db

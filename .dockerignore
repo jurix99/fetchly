@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+downloads/
+config/
+cookies/
+frontend/node_modules/
+frontend/dist/
+frontend/out/
+frontend/.next/
+app/web/
+.git/
+.gitignore
+README.md
