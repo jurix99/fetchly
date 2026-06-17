@@ -33,7 +33,8 @@ from yt_dlp.utils import DateRange
 from . import store
 
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = Path("/downloads")  # mounted as a volume in Docker
+# Mounted as a volume in Docker; override with DOWNLOAD_DIR for custom NAS shares.
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Optional Netscape-format cookies.txt, mounted into the container. Required to
@@ -46,7 +47,7 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "/cookies/cookies.txt")
 # this HTTP service during extraction.
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://bgutil-provider:4416")
 
-app = FastAPI(title="Fetchly — Video Downloader", version="0.0.1")
+app = FastAPI(title="Fetchly — Video Downloader", version="0.1.0")
 
 WEB_DIR = BASE_DIR / "web"  # built React SPA (Vite output, copied in Docker)
 WEB_DIR.mkdir(exist_ok=True)
@@ -218,6 +219,12 @@ class ExtractRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = 15
+
+
+class ChannelVideosRequest(BaseModel):
+    url: str
+    offset: int = 0  # how many videos to skip (for lazy pagination)
+    limit: int = 30  # page size
 
 
 class SettingsRequest(BaseModel):
@@ -1222,6 +1229,46 @@ async def channel_info(req: ExtractRequest) -> JSONResponse:
             "url": url,
             "subscribers": info.get("channel_follower_count"),
             "count": info.get("playlist_count"),
+        }
+    )
+
+
+@app.post("/api/channel/videos")
+async def channel_videos(req: ChannelVideosRequest) -> JSONResponse:
+    """A single page of a channel's videos, for lazy/infinite-scroll loading.
+    Uses yt-dlp's playlist_items range so only the requested slice is fetched
+    (newest-first) instead of enumerating the whole back-catalogue."""
+    url = req.url.strip()
+    if not url:
+        return JSONResponse({"error": "URL requise"}, status_code=400)
+    # Target the /videos tab for a channel (the bare URL lists tabs, not videos).
+    target = _channel_root(url).rstrip("/") + "/videos" if _is_channel_url(url) else url
+    limit = max(1, min(req.limit, 50))
+    start = max(0, req.offset) + 1
+    end = max(0, req.offset) + limit
+    log: list[str] = []
+    opts, temp_cookies = _common_opts(log)
+    opts["extract_flat"] = "in_playlist"
+    opts["lazy_playlist"] = True
+    opts["playlist_items"] = f"{start}:{end}"
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        if temp_cookies and os.path.exists(temp_cookies):
+            os.remove(temp_cookies)
+
+    entries = [e for e in ((info or {}).get("entries") or []) if e]
+    videos = [_video_dict(e) for e in entries]
+    return JSONResponse(
+        {
+            "videos": videos,
+            "offset": req.offset,
+            "limit": limit,
+            # If we got a full page, assume there may be more.
+            "has_more": len(videos) >= limit,
         }
     )
 

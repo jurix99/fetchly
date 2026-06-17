@@ -41,5 +41,13 @@ export const STATUS_META: Record<DownloadStatus, StatusMeta> = {
   },
 }
 
-export const QUALITIES = ["Auto", "1080p", "720p", "480p", "Audio seul"] as const
+export const QUALITIES = [
+  "Auto",
+  "2160p (4K)",
+  "1440p",
+  "1080p",
+  "720p",
+  "480p",
+  "Audio seul",
+] as const
 export const FORMATS = ["MP4", "MKV", "MP3", "M4A"] as const

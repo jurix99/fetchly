@@ -93,6 +93,14 @@ export interface ChannelInfoResult {
   error?: string
 }
 
+export interface ChannelVideosResult {
+  videos: ExtractedVideo[]
+  offset: number
+  limit: number
+  has_more: boolean
+  error?: string
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -108,6 +116,8 @@ export const backend = {
     call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
   extract: (url: string) => call<ExtractResult>("POST", "/api/extract", { url }),
   channelInfo: (url: string) => call<ChannelInfoResult>("POST", "/api/channel", { url }),
+  channelVideos: (url: string, offset: number, limit: number) =>
+    call<ChannelVideosResult>("POST", "/api/channel/videos", { url, offset, limit }),
   search: (query: string) => call<SearchResult>("POST", "/api/search", { query }),
   watches: () => call<BackendWatch[]>("GET", "/api/watches"),
   addWatch: (b: {
@@ -140,6 +150,8 @@ export const backend = {
 // --- quality label mapping (frontend <-> backend) ---
 const Q_TO_BACKEND: Record<string, string> = {
   Auto: "best",
+  "2160p (4K)": "2160",
+  "1440p": "1440",
   "1080p": "1080",
   "720p": "720",
   "480p": "480",
@@ -147,14 +159,16 @@ const Q_TO_BACKEND: Record<string, string> = {
 }
 const Q_TO_FRONTEND: Record<string, string> = {
   best: "Auto",
-  "2160": "1080p",
-  "1440": "1080p",
+  "2160": "2160p (4K)",
+  "1440": "1440p",
   "1080": "1080p",
   "720": "720p",
   "480": "480p",
   audio: "Audio seul",
 }
 
+const FRONTEND_QUALITIES = ["Auto", "2160p (4K)", "1440p", "1080p", "720p", "480p", "Audio seul"]
+
 export const qualityToBackend = (q: string) => Q_TO_BACKEND[q] ?? q
 export const qualityToFrontend = (q: string | null | undefined) =>
-  (q && (Q_TO_FRONTEND[q] ?? (["Auto", "1080p", "720p", "480p", "Audio seul"].includes(q) ? q : "Auto"))) || "Auto"
+  (q && (Q_TO_FRONTEND[q] ?? (FRONTEND_QUALITIES.includes(q) ? q : "Auto"))) || "Auto"

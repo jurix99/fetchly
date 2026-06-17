@@ -41,7 +41,7 @@ next to the compose file; settings and the subscription list live in `./config`.
 Published to GitHub Container Registry by CI:
 
 ```bash
-docker pull ghcr.io/<owner>/fetchly:0.0.1   # or :latest
+docker pull ghcr.io/<owner>/fetchly:0.1.0   # or :latest
 ```
 
 ## Getting past YouTube's defenses

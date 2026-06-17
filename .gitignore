@@ -8,6 +8,11 @@ cookies/*
 !cookies/README.txt
 .env
 .env*.local
+# Corporate / proxy root CAs — environment-specific, never commit the actual
+# certs, but keep the folder so the optional build-time COPY always resolves.
+certs/*
+!certs/.gitkeep
+!certs/README.md
 
 # ---- Python backend ----
 __pycache__/

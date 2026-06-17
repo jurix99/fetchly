@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.0] - 2026-06-17
+
+Search, an interactive channel browser, 4K, parallel subscription downloads, and
+first-class NAS deployment.
+
+### Added
+
+**Discovery & channels**
+- **Search by name** — find creators and videos without knowing a URL; results
+  are split into Chaînes and Vidéos.
+- **Channel dialog** — picking a channel opens its real logo + stats and a
+  video list that loads **lazily on scroll** (nothing fetched up front), with a
+  per-video download button and a **Suivre** action.
+- Real channel logos in search results (fetched in the background).
+
+**Downloading**
+- **2160p (4K)** and **1440p** quality options (VP9/AV1 + AAC, merged to MP4).
+- Thumbnails now shown in the Téléchargements list.
+
+**Subscriptions**
+- Choose what to grab when following: **only future uploads**, the **entire
+  back-catalogue**, or **from a chosen date** — editable later in the filters.
+- **Parallel backfill** — a subscription downloads several videos at once, up to
+  a configurable **max concurrent**, each shown live with its own progress.
+- Subscriptions show the channel name + logo immediately and surface live
+  backfill progress on the card.
+
+**NAS deployment**
+- LinuxServer-style **PUID / PGID / TZ / UMASK**: runs unprivileged via `gosu`
+  so downloads are owned by your NAS user, not root.
+- Container **healthcheck**, configurable `DOWNLOAD_DIR` / `CONFIG_DIR`.
+- Optional **build-time CA trust** (drop a `*.crt` in `certs/`) for building
+  behind a corporate TLS proxy; a no-op (clean image) otherwise.
+
+### Changed
+- Watch checks are **much faster**: flat channel listing instead of
+  deep-extracting every video.
+- Channels enumerate their real **videos (and Shorts)**, not the channel tabs.
+- Default container port is now **6776**.
+
+### Fixed
+- Duplicate subscriptions for the same channel are rejected (they downloaded the
+  same videos twice and clobbered each other's files).
+- Picking one video in a channel list no longer selects them all.
+- The merge/convert phase is shown correctly instead of jumping to "Terminé".
+
 ## [0.0.1] - 2026-06-16
 
 First release — a self-hosted video downloader built on
@@ -45,4 +91,5 @@ subscriptions. Runs as a single Docker image (plus a PO-token sidecar).
 - The stateless backend does not support pausing/cancelling a running download
   or per-subscription content filters; those controls are informational only.
 
+[0.1.0]: https://github.com/OWNER/REPO/releases/tag/v0.1.0
 [0.0.1]: https://github.com/OWNER/REPO/releases/tag/v0.0.1

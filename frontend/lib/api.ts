@@ -116,6 +116,20 @@ export async function fetchChannelVideos(
   return { channel, videos }
 }
 
+/** Une page de vidéos d'une chaîne (scroll infini / chargement paresseux). */
+export async function fetchChannelVideosPage(
+  channelUrl: string,
+  offset: number,
+  limit = 30,
+): Promise<{ videos: VideoPreview[]; hasMore: boolean }> {
+  const d = await backend.channelVideos(channelUrl, offset, limit)
+  if (d.error) throw new Error(d.error)
+  return {
+    videos: (d.videos ?? []).map((v, i) => toPreview(v, offset + i)),
+    hasMore: !!d.has_more,
+  }
+}
+
 /** Récupère les vidéos d'une playlist. */
 export async function fetchPlaylistVideos(
   url: string,

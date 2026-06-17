@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import {
   DownloadIcon,
   Loader2Icon,
@@ -35,6 +35,7 @@ import { QualitySelect, FormatSelect } from "@/components/option-selects"
 import { VideoPreviewCard } from "@/components/video-preview-card"
 import { Separator } from "@/components/ui/separator"
 import { ChannelVideoList } from "@/components/channel-video-list"
+import { ChannelDialog } from "@/components/channel-dialog"
 import { SubscriptionsPanel } from "@/components/subscriptions-panel"
 
 type Result =
@@ -52,6 +53,28 @@ export function YoutubeView() {
   const [result, setResult] = useState<Result>(null)
   const [quality, setQuality] = useState(settings.defaultQuality)
   const [format, setFormat] = useState(settings.defaultFormat)
+  // Channel picked from search results -> opens the actions dialog.
+  const [channelDialog, setChannelDialog] = useState<ChannelPreview | null>(null)
+  // Real channel logos fetched lazily for the search results (search itself
+  // doesn't carry avatars), keyed by channel URL.
+  const [channelAvatars, setChannelAvatars] = useState<Record<string, string>>({})
+
+  // When a search returns channels, fill in their real logos in the background
+  // (search results don't carry avatars). Runs once per new search result.
+  useEffect(() => {
+    if (result?.kind !== "search") return
+    let cancelled = false
+    result.channels.forEach((c) => {
+      fetchChannelInfo(c.url)
+        .then((info) => {
+          if (!cancelled) setChannelAvatars((m) => ({ ...m, [c.url]: info.avatar }))
+        })
+        .catch(() => {})
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [result])
 
   function onUrlChange(value: string) {
     setUrl(value)
@@ -88,6 +111,19 @@ export function YoutubeView() {
       setLoading(false)
     }
   }
+
+  // Click a channel (from a search result) -> open the actions dialog (Suivre /
+  // Voir les vidéos) rather than re-running a search with its URL.
+  async function onChannelClick(channelUrl: string) {
+    const cached = channelAvatars[channelUrl]
+    try {
+      const channel = await fetchChannelInfo(channelUrl)
+      setChannelDialog({ ...channel, avatar: channel.avatar || cached || "" })
+    } catch {
+      /* ignore — leave the dialog closed on failure */
+    }
+  }
+
 
   const kindLabel: Record<UrlKind, string> = {
     video: "Vidéo simple",
@@ -193,7 +229,7 @@ export function YoutubeView() {
               type="channel"
               channel={result.channel}
               videos={result.videos}
-              url={url}
+              url={result.channel.url}
               quality={quality}
               format={format}
               onQuality={setQuality}
@@ -219,11 +255,12 @@ export function YoutubeView() {
             <SearchResults
               videos={result.videos}
               channels={result.channels}
+              avatars={channelAvatars}
               quality={quality}
               format={format}
               onQuality={setQuality}
               onFormat={setFormat}
-              onOpenChannel={(u) => run(u)}
+              onOpenChannel={onChannelClick}
               onDownload={(v) =>
                 addDownload({
                   url: v.url || "",
@@ -253,6 +290,13 @@ export function YoutubeView() {
           <SubscriptionsPanel />
         </TabsContent>
       </Tabs>
+
+      <ChannelDialog
+        key={channelDialog?.url ?? "none"}
+        channel={channelDialog}
+        open={!!channelDialog}
+        onOpenChange={(o) => !o && setChannelDialog(null)}
+      />
     </div>
   )
 }
@@ -260,6 +304,7 @@ export function YoutubeView() {
 function SearchResults({
   videos,
   channels,
+  avatars,
   quality,
   format,
   onQuality,
@@ -269,6 +314,7 @@ function SearchResults({
 }: {
   videos: VideoPreview[]
   channels: ChannelResult[]
+  avatars: Record<string, string>
   quality: string
   format: string
   onQuality: (v: string) => void
@@ -301,9 +347,13 @@ function SearchResults({
                 className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-left transition-colors hover:bg-muted/50"
               >
                 <Avatar className="size-8">
-                  <AvatarImage src={c.avatar || "/placeholder.svg"} alt={c.name} />
-                  <AvatarFallback>
-                    <TvIcon className="size-4" />
+                  {/* Real logo arrives asynchronously (avatars map); until then
+                      the initial shows instead of a blank placeholder. */}
+                  {avatars[c.url] ? (
+                    <AvatarImage src={avatars[c.url]} alt={c.name} />
+                  ) : null}
+                  <AvatarFallback className="text-xs font-medium">
+                    {c.name.charAt(0).toUpperCase() || <TvIcon className="size-4" />}
                   </AvatarFallback>
                 </Avatar>
                 <span className="text-sm font-medium">{c.name}</span>

@@ -14,8 +14,22 @@ services:
       # Settings, watch list and the download archive (so they survive restarts).
       - ./config:/config
     environment:
+      # Run as your NAS user so downloads aren't owned by root.
+      # On Synology/Unraid: id <user>  ->  use its uid/gid here.
+      - PUID=1000
+      - PGID=1000
+      # Timezone for logs and the watch scheduler (e.g. Europe/Paris).
+      - TZ=Europe/London
+      # File permission mask for created files/folders (022 = 755/644).
+      - UMASK=022
       # Where to reach the PO-token provider (the sidecar service below).
       - POT_PROVIDER_URL=http://bgutil-provider:4416
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6776/api/settings', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on:
       - bgutil-provider
     restart: unless-stopped
