@@ -36,10 +36,17 @@ export interface VideoPreview {
   duration: string // "12:34"
   channel: string
   source: string
+  url?: string // direct watch URL (used to download an individual result)
   views?: string
   uploaded?: string
   isShort?: boolean
   isLive?: boolean
+}
+
+export interface ChannelResult {
+  name: string
+  url: string
+  avatar?: string
 }
 
 export interface ChannelPreview {
@@ -80,6 +87,7 @@ export interface Subscription {
   checkIntervalHours: number
   active: boolean
   lastChecked: string
+  dateAfter?: string // ISO "YYYY-MM-DD"; only sync uploads on/after this date
   filters: SubscriptionFilters
   defaultQuality: string
   defaultFormat: string

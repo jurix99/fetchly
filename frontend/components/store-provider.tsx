@@ -22,9 +22,20 @@ import {
 } from "@/lib/backend"
 import type { DownloadItem, DownloadStatus, Settings, Subscription } from "@/lib/types"
 
+/** Live progress of a subscription's background sync/backfill job. */
+export interface WatchProgress {
+  active: boolean // job running/queued (may just be listing/checking)
+  downloading: boolean // actually downloading a video right now
+  percent: number
+  currentTitle: string
+  completed: number
+  total: number
+}
+
 interface StoreValue {
   downloads: DownloadItem[]
   subscriptions: Subscription[]
+  watchProgress: Record<string, WatchProgress>
   settings: Settings
   maxConcurrent: number
   bandwidthLimit: number
@@ -48,7 +59,15 @@ interface StoreValue {
   checkSubscriptionNow: (id: string) => Promise<void>
   updateSubscription: (id: string, patch: Partial<Subscription>) => void
   removeSubscription: (id: string) => void
-  addSubscription: (sub: Subscription) => void
+  addSubscription: (sub: Subscription, opts?: BackfillOptions) => void
+}
+
+/** How much of a channel's back-catalogue to grab when first following it. */
+export interface BackfillOptions {
+  // true  -> download existing videos (optionally only those after `dateAfter`)
+  // false -> seed only: ignore the back-catalogue, grab future uploads only
+  backfill?: boolean
+  dateAfter?: string // ISO "YYYY-MM-DD"; only with backfill
 }
 
 const StoreContext = createContext<StoreValue | null>(null)
@@ -60,20 +79,57 @@ const STATUS_MAP: Record<BackendJob["status"], DownloadStatus> = {
   error: "failed",
 }
 
+/** Extract a YouTube video id from a watch/share URL, if present. */
+function youtubeId(url: string): string | null {
+  const m =
+    url.match(/[?&]v=([\w-]{11})/) ||
+    url.match(/youtu\.be\/([\w-]{11})/) ||
+    url.match(/\/(?:shorts|embed)\/([\w-]{11})/)
+  return m ? m[1] : null
+}
+
+/** A thumbnail URL for a single YouTube video job (empty for channels/playlists). */
+function youtubeThumb(url: string): string {
+  const id = youtubeId(url)
+  return id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : ""
+}
+
+/** Readable fallback name for a subscription before its title is synced:
+ *  "@handle" / channel slug rather than the full URL. */
+function channelHandle(url: string): string {
+  try {
+    const path = new URL(url).pathname.replace(/\/+$/, "")
+    const seg = path.split("/").filter(Boolean)
+    const at = seg.find((s) => s.startsWith("@"))
+    if (at) return at
+    return seg[seg.length - 1] || url
+  } catch {
+    return url
+  }
+}
+
 function jobToDownload(j: BackendJob): DownloadItem {
   // While ffmpeg merges/converts after the streams are downloaded, show
-  // "converting" rather than a stuck-looking 100% download.
+  // "converting" rather than a stuck-looking 100% download. The post-processor
+  // signal (phase) can be missed between polls, so also treat a running job
+  // whose download already hit 100% as converting.
+  const downloadComplete = (j.current_percent || 0) >= 99.5
   const status: DownloadStatus =
-    j.status === "running" && j.phase === "processing"
+    j.status === "running" && (j.phase === "processing" || downloadComplete)
       ? "converting"
       : STATUS_MAP[j.status] ?? "queued"
+  const isWatch = j.kind === "watch"
   return {
     id: j.id,
-    title: j.current_title || j.url,
-    thumbnail: "",
+    // A watch job downloads a whole channel/playlist: show its name (or the
+    // current video), never the raw channel URL.
+    title: j.current_title || (isWatch ? j.playlist_title || "Synchronisation de l'abonnement" : j.url),
+    // Thumbnail of the video currently downloading (set by the backend), with a
+    // fallback to deriving it from a single-video job's own URL.
+    thumbnail: j.current_thumbnail || (isWatch ? "" : youtubeThumb(j.url)),
     sourceUrl: j.url,
     source: detectSource(j.url),
-    channel: j.kind === "watch" ? "Abonnement" : undefined,
+    channel: isWatch ? "Abonnement" : undefined,
     quality: qualityToFrontend(j.quality),
     format: "MP4",
     status,
@@ -90,12 +146,13 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
   return {
     id: w.id,
     type: /list=|playlist/i.test(w.url) ? "playlist" : "channel",
-    name: w.title || w.url,
-    avatar: "",
+    name: w.title || channelHandle(w.url),
+    avatar: w.thumbnail || "",
     url: w.url,
     checkIntervalHours: intervalHours,
     active: w.enabled,
     lastChecked: w.last_checked || new Date().toISOString(),
+    dateAfter: w.date_after || "",
     filters: { excludeShorts: false, excludeLives: false, includeKeywords: [], excludeKeywords: [] },
     defaultQuality: qualityToFrontend(w.quality),
     defaultFormat: "MP4",
@@ -111,7 +168,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // Local-only settings the backend doesn't persist.
   const [local, setLocal] = useState<Partial<Settings> & { checkIntervalHours?: number }>({
     defaultFormat: "MP4",
-    maxConcurrent: 3,
+    // maxConcurrent is backend-persisted; leave it unset so the saved value wins.
     bandwidthLimit: "",
     subtitles: { enabled: false, languages: [], embed: false },
     embedMetadata: false,
@@ -154,7 +211,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       embedMetadata: !!local.embedMetadata,
       embedThumbnail: local.embedThumbnail ?? true,
       embedChapters: !!local.embedChapters,
-      maxConcurrent: local.maxConcurrent ?? 3,
+      maxConcurrent: local.maxConcurrent ?? bset?.max_concurrent ?? 3,
       bandwidthLimit: local.bandwidthLimit ?? "",
       sponsorBlock: !!local.sponsorBlock,
       sponsorBlockMode: local.sponsorBlockMode || "skip",
@@ -168,7 +225,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   )
 
   const downloads = useMemo(
-    () => jobs.filter((j) => !hidden.has(j.id)).map(jobToDownload),
+    // Manual downloads always show. Subscription syncs show only while they're
+    // actually downloading a video (current_title set) — so the live download
+    // is visible, but a bare "checking" job doesn't clutter the list with the
+    // channel itself.
+    () =>
+      jobs
+        .filter((j) => !hidden.has(j.id) && (j.kind !== "watch" || !!j.current_title))
+        .map(jobToDownload),
     [jobs, hidden],
   )
   const subscriptions = useMemo(
@@ -176,8 +240,58 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [watches, intervalHours],
   )
 
+  // Per-watch sync progress for the Abonnements card. Each subscription now
+  // backfills as MANY single-video jobs, so we aggregate them per watch_id:
+  // how many are done out of the batch, and whether any is downloading now.
+  const watchProgress = useMemo(() => {
+    type Acc = {
+      total: number
+      done: number
+      active: boolean
+      downloading: boolean
+      currentTitle: string
+    }
+    const acc: Record<string, Acc> = {}
+    for (const j of jobs) {
+      if (j.kind !== "watch" || !j.watch_id) continue
+      const a = (acc[j.watch_id] ??= {
+        total: 0,
+        done: 0,
+        active: false,
+        downloading: false,
+        currentTitle: "",
+      })
+      a.total += 1
+      if (j.status === "done") a.done += 1
+      const running = j.status === "running" || j.status === "queued"
+      if (running) a.active = true
+      const dl = running && j.current_percent > 0 && (!!j.current_speed || j.current_percent < 100)
+      if (dl) {
+        a.downloading = true
+        a.currentTitle = j.current_title || a.currentTitle
+      }
+    }
+    const map: Record<string, WatchProgress> = {}
+    for (const [id, a] of Object.entries(acc)) {
+      map[id] = {
+        active: a.active,
+        downloading: a.downloading,
+        percent: a.total ? Math.round((a.done / a.total) * 100) : 0,
+        currentTitle: a.currentTitle,
+        completed: a.done,
+        total: a.total,
+      }
+    }
+    return map
+  }, [jobs])
+
   const activeCount = useMemo(
-    () => jobs.filter((j) => j.status === "running" || j.status === "queued").length,
+    () =>
+      jobs.filter(
+        (j: BackendJob) =>
+          (j.kind !== "watch" || !!j.current_title) &&
+          (j.status === "running" || j.status === "queued"),
+      ).length,
     [jobs],
   )
   const totalSpeed = useMemo(() => {
@@ -234,7 +348,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     toast.success("Terminés masqués")
   }, [jobs])
 
-  const setMaxConcurrent = useCallback((n: number) => setLocal((l) => ({ ...l, maxConcurrent: n })), [])
+  const setMaxConcurrent = useCallback((n: number) => {
+    setLocal((l) => ({ ...l, maxConcurrent: n }))
+    backend.saveSettings({ max_concurrent: Math.max(1, n) }).then(setBset).catch(() => {})
+  }, [])
   const setBandwidthLimit = useCallback(
     (n: number) => setLocal((l) => ({ ...l, bandwidthLimit: n ? String(n) : "" })),
     [],
@@ -284,6 +401,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     (id: string, patch: Partial<Subscription>) => {
       const b: Record<string, unknown> = {}
       if (patch.defaultQuality) b.quality = qualityToBackend(patch.defaultQuality)
+      if (patch.dateAfter !== undefined) b.date_after = patch.dateAfter
       const ops: Promise<unknown>[] = []
       if (Object.keys(b).length) ops.push(backend.patchWatch(id, b))
       if (patch.checkIntervalHours !== undefined)
@@ -306,14 +424,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   )
 
   const addSubscription = useCallback(
-    (sub: Subscription) => {
+    (sub: Subscription, opts?: BackfillOptions) => {
       backend
         .addWatch({
           url: sub.url,
           quality: qualityToBackend(sub.defaultQuality),
-          backfill: true,
+          backfill: opts?.backfill ?? true,
           subfolder: "",
-          date_after: "",
+          date_after: opts?.dateAfter ?? "",
+          // Show the name + logo immediately, before the first sync fills them in.
+          title: sub.name,
+          thumbnail: sub.avatar,
         })
         .then((res) => {
           if ((res as { error?: string }).error) {
@@ -330,6 +451,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const value: StoreValue = {
     downloads,
     subscriptions,
+    watchProgress,
     settings,
     maxConcurrent: settings.maxConcurrent,
     bandwidthLimit: Number(settings.bandwidthLimit) || 0,

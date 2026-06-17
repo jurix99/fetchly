@@ -16,11 +16,12 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -32,7 +33,8 @@ from yt_dlp.utils import DateRange
 from . import store
 
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = Path("/downloads")  # mounted as a volume in Docker
+# Mounted as a volume in Docker; override with DOWNLOAD_DIR for custom NAS shares.
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Optional Netscape-format cookies.txt, mounted into the container. Required to
@@ -45,7 +47,7 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "/cookies/cookies.txt")
 # this HTTP service during extraction.
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "http://bgutil-provider:4416")
 
-app = FastAPI(title="Fetchly — Video Downloader", version="0.0.1")
+app = FastAPI(title="Fetchly — Video Downloader", version="0.1.0")
 
 WEB_DIR = BASE_DIR / "web"  # built React SPA (Vite output, copied in Docker)
 WEB_DIR.mkdir(exist_ok=True)
@@ -178,6 +180,7 @@ class Job:
     completed: int = 0
     downloaded: int = 0  # how many were actually new (not skipped)
     current_title: str = ""
+    current_thumbnail: str = ""  # thumbnail of the video currently downloading
     current_percent: float = 0.0
     current_speed: str = ""
     files: list[str] = field(default_factory=list)
@@ -213,10 +216,22 @@ class ExtractRequest(BaseModel):
     url: str
 
 
+class SearchRequest(BaseModel):
+    query: str
+    limit: int = 15
+
+
+class ChannelVideosRequest(BaseModel):
+    url: str
+    offset: int = 0  # how many videos to skip (for lazy pagination)
+    limit: int = 30  # page size
+
+
 class SettingsRequest(BaseModel):
     default_quality: str | None = None
     watch_interval_minutes: int | None = None
     organize: str | None = None
+    max_concurrent: int | None = None
 
 
 class WatchRequest(BaseModel):
@@ -225,12 +240,15 @@ class WatchRequest(BaseModel):
     backfill: bool = True
     subfolder: str = ""
     date_after: str = ""  # ISO date "YYYY-MM-DD"; only sync newer uploads
+    title: str = ""  # known channel name, so the card shows it before first sync
+    thumbnail: str = ""  # known channel avatar, shown before first sync
 
 
 class WatchUpdate(BaseModel):
     enabled: bool | None = None
     quality: str | None = None
     subfolder: str | None = None
+    date_after: str | None = None  # ISO "YYYY-MM-DD"; "" clears the filter
 
 
 # --- yt-dlp option building ------------------------------------------------
@@ -244,6 +262,11 @@ def _common_opts(log: list[str]) -> tuple[dict[str, Any], str | None]:
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
+        # Skip TLS verification: corporate proxies (e.g. Ekimetrics) perform TLS
+        # interception with a self-signed root CA that yt-dlp won't trust,
+        # causing "CERTIFICATE_VERIFY_FAILED: self-signed certificate in
+        # certificate chain". Only safe on a trusted network.
+        "nocheckcertificate": True,
         "extractor_args": {
             # Try several player clients: YouTube serves different format sets
             # per client, widening availability and dodging "format not
@@ -289,6 +312,127 @@ def _log_available_formats(ydl: YoutubeDL, video_url: str, job: Job) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         job.log.append(f"  ↳ could not list formats: {exc}")
+
+
+def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int) -> None:
+    """Download a playlist/channel's videos several at a time. Each worker uses
+    its OWN YoutubeDL instance (and its own temp cookie copy, since yt-dlp
+    rewrites the cookie jar on close) to stay thread-safe. Progress is shown as
+    a completed/total count plus the summed live speed.
+
+    For a date-limited backfill we download in ORDERED BATCHES so we can still
+    stop early: once a whole batch is rejected by the date filter (channels list
+    newest-first), everything after is older too and we stop."""
+    speeds: dict[str, float] = {}
+    lock = threading.Lock()
+    DATE_STOP_AFTER = 3
+
+    # Pre-filter videos already in the archive (cheap, no download).
+    new_entries: list[dict[str, Any]] = []
+    probe_opts, probe_cookie = _common_opts(job.log)
+    if job.use_archive:
+        probe_opts["download_archive"] = str(store.ARCHIVE_FILE)
+    try:
+        with YoutubeDL(probe_opts) as probe:
+            for entry in targets:
+                if not entry:
+                    job.completed += 1
+                    continue
+                if job.use_archive and probe.in_download_archive(entry):
+                    job.completed += 1
+                    continue
+                new_entries.append(entry)
+    finally:
+        if probe_cookie and os.path.exists(probe_cookie):
+            os.remove(probe_cookie)
+
+    def aggregate() -> None:
+        with lock:
+            job.current_speed = (
+                f"{sum(speeds.values()) / 1_000_000:.1f} MB/s" if speeds else ""
+            )
+            active = len(speeds)
+            if active:
+                job.current_title = f"{active} vidéo(s) en cours…"
+
+    def work(entry: dict[str, Any]) -> str:  # "downloaded" | "rejected" | "failed"
+        vid = str(entry.get("id") or id(entry))
+        video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+        title = entry.get("title", "")
+        thumb = _entry_thumb(entry)
+        if thumb:
+            job.current_thumbnail = thumb
+
+        def hook(d: dict[str, Any]) -> None:
+            if d["status"] == "downloading":
+                with lock:
+                    speeds[vid] = d.get("speed") or 0.0
+            elif d["status"] in ("finished", "error"):
+                with lock:
+                    speeds.pop(vid, None)
+            aggregate()
+
+        w_opts, w_cookie = _common_opts(job.log)
+        w_opts.update(
+            {
+                "outtmpl": _outtmpl(job.dest),
+                "noplaylist": True,
+                "progress_hooks": [hook],
+                "concurrent_fragment_downloads": 4,
+                "allow_playlist_files": False,
+                **_format_opts(job.quality, job.fmt),
+            }
+        )
+        if job.use_archive:
+            w_opts["download_archive"] = str(store.ARCHIVE_FILE)
+        if job.date_after:
+            w_opts["daterange"] = DateRange(job.date_after.replace("-", ""), None)
+        status = "rejected"
+        try:
+            with YoutubeDL(w_opts) as ydl:
+                result = ydl.extract_info(video_url, download=True)
+            if result is not None:
+                ext = {"MP3": "mp3", "M4A": "m4a", "MKV": "mkv"}.get(job.fmt.upper(), "mp4")
+                final = str(Path(ydl.prepare_filename(result)).with_suffix("." + ext))
+                with lock:
+                    job.files.append(Path(final).name)
+                    job.downloaded += 1
+                job.log.append(f"Downloaded: {title}")
+                status = "downloaded"
+            else:
+                job.log.append(f"Skipped: {title}")
+        except Exception as exc:  # noqa: BLE001
+            job.log.append(f"Failed: {title} ({exc})")
+            status = "failed"
+        finally:
+            if w_cookie and os.path.exists(w_cookie):
+                os.remove(w_cookie)
+            with lock:
+                speeds.pop(vid, None)
+                job.completed += 1
+                job.current_percent = job.completed / job.total * 100 if job.total else 0.0
+            aggregate()
+        return status
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        if not job.date_after:
+            list(ex.map(work, new_entries))
+            return
+        # Date-limited: ordered batches, stop once a full batch is date-rejected.
+        consecutive_rejects = 0
+        for i in range(0, len(new_entries), concurrency):
+            batch = new_entries[i : i + concurrency]
+            statuses = list(ex.map(work, batch))
+            if all(s == "rejected" for s in statuses):
+                consecutive_rejects += len(batch)
+            elif any(s == "downloaded" for s in statuses):
+                consecutive_rejects = 0
+            if consecutive_rejects >= DATE_STOP_AFTER:
+                job.log.append("Reached the date cutoff — stopping.")
+                break
+        # We stopped early, so the channel's full count is meaningless here —
+        # report progress against what we actually processed.
+        job.total = max(job.completed, 1)
 
 
 def _run_job(job: Job) -> None:
@@ -340,35 +484,72 @@ def _run_job(job: Job) -> None:
         ydl_opts["daterange"] = DateRange(job.date_after.replace("-", ""), None)
 
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            # Flat listing first, just to learn the entries / total count.
-            info = ydl.extract_info(job.url, download=False)
-            entries = info.get("entries") if info else None
-            if entries is not None:
-                entries = [e for e in entries if e]
-                job.total = len(entries)
-                job.playlist_title = (info or {}).get("title", "")
-                job.log.append(f"Found {job.total} videos.")
-            else:
-                job.total = 1  # single video
+        # FLAT listing first to learn the entries/total. This MUST be flat:
+        # extracting a channel without extract_flat deep-extracts every video's
+        # metadata (1000+ page loads for a big channel) — that is what made watch
+        # checks take minutes. The per-video download below re-extracts each.
+        list_opts, list_cookies = _common_opts(job.log)
+        list_opts["extract_flat"] = "in_playlist"
+        try:
+            with YoutubeDL(list_opts) as lydl:
+                info = lydl.extract_info(job.url, download=False)
+        finally:
+            if list_cookies and os.path.exists(list_cookies):
+                os.remove(list_cookies)
 
-            targets = entries if entries is not None else [info]
+        entries = info.get("entries") if info else None
+        if entries is not None:
+            entries = [e for e in entries if e]
+            job.total = len(entries)
+            job.playlist_title = (info or {}).get("title", "")
+            job.log.append(f"Found {job.total} videos.")
+        else:
+            job.total = 1  # single video
+        targets = entries if entries is not None else [info]
+
+        # Parallel path for multi-video jobs: download several at once, up to the
+        # configured limit. Handles the date filter too (ordered batches with an
+        # early stop). Single videos fall through to the sequential path.
+        concurrency = max(1, int(store.get_settings().get("max_concurrent", 3) or 3))
+        if entries is not None and concurrency > 1:
+            job.log.append(f"Downloading up to {concurrency} videos in parallel.")
+            _download_parallel(job, targets, concurrency)
+            job.status = "done"
+            job.log.append(f"Finished. {job.downloaded} new file(s).")
+            return
+
+        # For a date-limited backfill, count consecutive date-rejected videos so
+        # we can stop once we hit the (contiguous, newest-first) older tail —
+        # while tolerating the odd isolated skip (private/members video).
+        date_misses = 0
+        DATE_STOP_AFTER = 3
+        with YoutubeDL(ydl_opts) as ydl:
             for entry in targets:
                 if not entry:
                     job.completed += 1
                     continue
                 if job.use_archive and ydl.in_download_archive(entry):
                     job.completed += 1
+                    date_misses = 0  # already-have means we're still in range
                     continue  # already have it; stay quiet to keep logs short
                 video_url = entry.get("webpage_url") or entry.get("url") or entry.get("id")
                 job.current_title = entry.get("title", "")
+                job.current_thumbnail = _entry_thumb(entry) or job.current_thumbnail
                 job.current_percent = 0.0
                 job.phase = "downloading"
                 try:
                     result = ydl.extract_info(video_url, download=True)
                     if result is None:
                         job.log.append(f"Skipped: {entry.get('title', '')}")
+                        date_misses += 1
+                        if job.date_after and entries is not None and date_misses >= DATE_STOP_AFTER:
+                            # Reached the older-than-cutoff tail — stop scanning the
+                            # rest of the channel. (-1: the finally adds the last +1.)
+                            job.completed = job.total - 1
+                            job.log.append("Reached the date cutoff — stopping.")
+                            break
                     else:
+                        date_misses = 0
                         ext = {"MP3": "mp3", "M4A": "m4a", "MKV": "mkv"}.get(
                             job.fmt.upper(), "mp4"
                         )
@@ -383,10 +564,6 @@ def _run_job(job: Job) -> None:
                         _log_available_formats(ydl, video_url, job)
                 finally:
                     job.completed += 1
-
-        # For a watch, remember which videos are now synced vs pending.
-        if job.watch_id:
-            _record_sync(job.watch_id, job.url, job.log)
 
         job.status = "done"
         job.log.append(f"Finished. {job.downloaded} new file(s).")
@@ -414,61 +591,184 @@ def _archive_ids() -> set[str]:
     return ids
 
 
-def _record_sync(watch_id: str, url: str, log: list[str]) -> None:
-    """Persist the watch's full video list and whether each one is downloaded.
+# Channel tab path segments (.../@name/<tab>); stripped to reach the root.
+_CHANNEL_TABS = ("videos", "shorts", "streams", "live", "playlists", "featured", "community")
 
-    Uses its own flat extraction *without* the download archive — the archive
-    would otherwise hide already-downloaded videos from the listing."""
+
+def _is_channel_url(url: str) -> bool:
+    u = url.lower()
+    return "/@" in u or "/channel/" in u or "/c/" in u or "/user/" in u
+
+
+def _channel_root(url: str) -> str:
+    """Strip a trailing tab segment (/videos, /shorts, …) and any query so we
+    target the channel's main page, where yt-dlp exposes the avatar."""
+    try:
+        parts = urlsplit(url)
+        segs = [s for s in parts.path.split("/") if s and s.lower() not in _CHANNEL_TABS]
+        return urlunsplit((parts.scheme, parts.netloc, "/" + "/".join(segs), "", ""))
+    except Exception:  # noqa: BLE001
+        return url
+
+
+def _fetch_channel_avatar(url: str, log: list[str]) -> str:
+    """Best-effort fetch of a channel's avatar via a cheap metadata-only
+    extraction of its root page (playlist_items=1 avoids listing every video).
+    The flat /videos listing used elsewhere does not carry the avatar."""
+    if not _is_channel_url(url):
+        return ""
     opts, temp_cookies = _common_opts(log)
-    opts["extract_flat"] = "in_playlist"
+    opts["extract_flat"] = True
+    opts["playlist_items"] = "1"
     try:
         with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(_channel_root(url), download=False)
+        return _channel_avatar(info or {})
+    except Exception:  # noqa: BLE001
+        return ""
     finally:
         if temp_cookies and os.path.exists(temp_cookies):
             os.remove(temp_cookies)
 
-    entries = [e for e in ((info or {}).get("entries") or []) if e]
-    ids = _archive_ids()
-    videos = []
-    synced = 0
-    for entry in entries:
-        is_sync = entry.get("id") in ids
-        synced += int(is_sync)
-        videos.append(
-            {
-                "id": entry.get("id"),
-                "title": entry.get("title") or entry.get("id") or "",
-                "synced": is_sync,
-            }
-        )
-    store.save_watch_videos(watch_id, videos)
-    store.update_watch(
-        watch_id,
-        synced=synced,
-        total=len(videos),
-        title=(info or {}).get("title") or (store.get_watch(watch_id) or {}).get("title", ""),
-    )
+
+def _channel_avatar(info: dict[str, Any]) -> str:
+    """Pick a channel's round avatar from a flat extraction's thumbnails.
+
+    YouTube tags the avatar with an id containing "avatar"; otherwise prefer the
+    most square thumbnail (avatars are square, banners are wide) so we never
+    return the channel banner. Falls back to the first thumbnail / the plain
+    thumbnail field."""
+    thumbs = info.get("thumbnails") or []
+    for t in thumbs:
+        if "avatar" in str(t.get("id", "")).lower() and t.get("url"):
+            return t["url"]
+    best, best_ratio = "", 99.0
+    for t in thumbs:
+        w, h = t.get("width"), t.get("height")
+        if t.get("url") and w and h:
+            ratio = abs(w / h - 1)
+            if ratio < best_ratio:
+                best, best_ratio = t["url"], ratio
+    if best:
+        return best
+    if thumbs and thumbs[0].get("url"):
+        return thumbs[0]["url"]
+    return info.get("thumbnail") or ""
 
 
-def _seed_archive(url: str, log: list[str]) -> tuple[str, list[dict[str, Any]]]:
+# Global pool that performs the actual video downloads, plus a resizable gate so
+# a watch can fetch several videos at once (each video is its own Job) without
+# ever exceeding the configured limit across all watches.
+_DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="dl")
+_DL_GATE = threading.Semaphore(3)
+_DL_GATE_LOCK = threading.Lock()
+
+
+def _set_download_concurrency(n: int) -> None:
+    global _DL_GATE
+    with _DL_GATE_LOCK:
+        _DL_GATE = threading.Semaphore(max(1, min(int(n), 10)))
+
+
+def _run_job_gated(job: Job) -> None:
+    """Run a single-video job, but only once a concurrency slot is free."""
+    with _DL_GATE_LOCK:
+        gate = _DL_GATE
+    gate.acquire()
+    try:
+        _run_job(job)
+    finally:
+        gate.release()
+
+
+def _flat_list(url: str, log: list[str]) -> list[dict[str, Any]]:
+    """Flat (id/title only) listing of a URL's entries, newest-first."""
+    opts, cookie = _common_opts(log)
+    opts["extract_flat"] = "in_playlist"
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return [e for e in ((info or {}).get("entries") or []) if e]
+    except Exception as exc:  # noqa: BLE001
+        log.append(f"List {url}: {exc}")
+        return []
+    finally:
+        if cookie and os.path.exists(cookie):
+            os.remove(cookie)
+
+
+def _watch_sources(url: str) -> list[str]:
+    """URLs that flat-list a watch's ACTUAL videos. A bare channel URL lists its
+    tabs (Videos/Shorts/…), not videos, so target /videos and /shorts directly."""
+    if _is_channel_url(url):
+        root = _channel_root(url).rstrip("/")
+        return [f"{root}/videos", f"{root}/shorts"]
+    return [url]
+
+
+def _collect_new_videos(watch: dict[str, Any], log: list[str]) -> list[dict[str, Any]]:
+    """Real videos (and shorts) for this watch not yet in the archive, optionally
+    filtered by the watch's date — newest-first with an early stop once we pass
+    the cutoff so we don't scan the whole back-catalogue."""
+    after = (watch.get("date_after") or "").replace("-", "")
+    archived = _archive_ids()
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for src in _watch_sources(watch["url"]):
+        candidates = [
+            e
+            for e in _flat_list(src, log)
+            if e.get("id") and e["id"] not in archived and e["id"] not in seen
+        ]
+        if not after:
+            for e in candidates:
+                seen.add(e["id"])
+                out.append(e)
+            continue
+        # Date filter with early stop (entries are newest-first within a source).
+        # Cap the scan so that if upload dates are unavailable we don't walk the
+        # entire back-catalogue — the in-range videos are at the front anyway.
+        opts, cookie = _common_opts(log)
+        misses = 0
+        checked = 0
+        SCAN_CAP = 300
+        try:
+            with YoutubeDL(opts) as ydl:
+                for e in candidates:
+                    if checked >= SCAN_CAP:
+                        break
+                    checked += 1
+                    vurl = e.get("url") or e.get("webpage_url") or e["id"]
+                    try:
+                        meta = ydl.extract_info(vurl, download=False, process=False)
+                    except Exception:  # noqa: BLE001
+                        meta = None
+                    ud = (meta or {}).get("upload_date")
+                    if ud and ud < after:
+                        misses += 1
+                        if misses >= 3:
+                            break
+                        continue
+                    misses = 0
+                    seen.add(e["id"])
+                    out.append(e)
+        finally:
+            if cookie and os.path.exists(cookie):
+                os.remove(cookie)
+    return out
+
+
+def _seed_archive(url: str, log: list[str]) -> list[dict[str, Any]]:
     """Record a watch's existing videos into the download archive WITHOUT
-    downloading them, so a 'no backfill' watch only grabs uploads from now on.
-    Returns (playlist_title, entries)."""
-    opts, temp_cookies = _common_opts(log)
-    opts["extract_flat"] = "in_playlist"
-    try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            entries = [e for e in ((info or {}).get("entries") or []) if e]
-            with store.ARCHIVE_FILE.open("a", encoding="utf-8") as f:
-                for entry in entries:
-                    if entry.get("id"):
-                        f.write(f"youtube {entry['id']}\n")
-            return (info or {}).get("title", ""), entries
-    finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+    downloading them, so a 'no backfill' watch only grabs uploads from now on."""
+    entries: list[dict[str, Any]] = []
+    for src in _watch_sources(url):
+        entries.extend(_flat_list(src, log))
+    with store.ARCHIVE_FILE.open("a", encoding="utf-8") as f:
+        for entry in entries:
+            if entry.get("id"):
+                f.write(f"youtube {entry['id']}\n")
+    return entries
 
 
 def _run_watch_check(watch: dict[str, Any]) -> None:
@@ -491,11 +791,12 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
     store.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     quality = watch.get("quality") or store.get_settings()["default_quality"]
 
+    log: list[str] = []
+
     # First run with backfill disabled: just mark existing videos as seen.
     if not watch.get("backfill", True) and not watch.get("seeded"):
-        log: list[str] = []
         try:
-            title, entries = _seed_archive(watch["url"], log)
+            entries = _seed_archive(watch["url"], log)
             videos = [
                 {"id": e.get("id"), "title": e.get("title") or e.get("id") or "", "synced": True}
                 for e in entries
@@ -505,7 +806,7 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
             store.update_watch(
                 watch["id"],
                 seeded=True,
-                title=title or watch.get("title", ""),
+                thumbnail=_fetch_channel_avatar(watch["url"], log) or watch.get("thumbnail", ""),
                 synced=len(videos),
                 total=len(videos),
                 last_checked=_now_iso(),
@@ -517,30 +818,51 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
             )
         return
 
-    job = Job(
-        id=str(uuid.uuid4()),
-        url=watch["url"],
-        quality=quality,
-        kind="watch",
-        use_archive=True,
-        watch_id=watch["id"],
-        dest=watch.get("subfolder", ""),
-        date_after=watch.get("date_after", ""),
-    )
-    with JOBS_LOCK:
-        JOBS[job.id] = job
-    _run_job(job)
-    result = (
-        f"error: {job.error}"
-        if job.status == "error"
-        else f"{job.downloaded} new" if job.downloaded else "up to date"
-    )
+    # Backfill / new-video check: one Job per real video, downloaded with bounded
+    # concurrency via the global pool. We wait for them to finish so the watch
+    # stays "checking" and a re-check can't re-queue the same videos.
+    try:
+        to_dl = _collect_new_videos(watch, log)
+    except Exception as exc:  # noqa: BLE001
+        store.update_watch(
+            watch["id"], last_checked=_now_iso(), last_result=f"Check error: {exc}"
+        )
+        return
+
+    jobs: list[Job] = []
+    for entry in to_dl:
+        vurl = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+        if not vurl:
+            continue
+        job = Job(
+            id=str(uuid.uuid4()),
+            url=vurl,
+            quality=quality,
+            kind="watch",
+            use_archive=True,
+            watch_id=watch["id"],
+            dest=watch.get("subfolder", ""),
+        )
+        job.total = 1
+        job.current_title = entry.get("title", "")
+        job.current_thumbnail = _entry_thumb(entry)
+        with JOBS_LOCK:
+            JOBS[job.id] = job
+        jobs.append(job)
+
+    for future in [_DOWNLOAD_POOL.submit(_run_job_gated, j) for j in jobs]:
+        try:
+            future.result()
+        except Exception:  # noqa: BLE001
+            pass
+
+    downloaded = sum(j.downloaded for j in jobs)
     store.update_watch(
         watch["id"],
         seeded=True,
         last_checked=_now_iso(),
-        title=job.playlist_title or watch.get("title", ""),
-        last_result=result,
+        thumbnail=_fetch_channel_avatar(watch["url"], log) or watch.get("thumbnail", ""),
+        last_result=f"{downloaded} new" if downloaded else "up to date",
     )
 
 
@@ -594,6 +916,7 @@ def _cleanup_partials() -> None:
 @app.on_event("startup")
 def _on_startup() -> None:
     _cleanup_partials()
+    _set_download_concurrency(store.get_settings().get("max_concurrent", 3))
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
 
@@ -649,13 +972,15 @@ async def get_settings() -> JSONResponse:
 @app.post("/api/settings")
 async def set_settings(req: SettingsRequest) -> JSONResponse:
     cfg = store.update_settings(
-        req.default_quality, req.watch_interval_minutes, req.organize
+        req.default_quality, req.watch_interval_minutes, req.organize, req.max_concurrent
     )
+    _set_download_concurrency(cfg.get("max_concurrent", 3))
     return JSONResponse(
         {
             "default_quality": cfg["default_quality"],
             "watch_interval_minutes": cfg["watch_interval_minutes"],
             "organize": cfg["organize"],
+            "max_concurrent": cfg.get("max_concurrent", 3),
         }
     )
 
@@ -667,14 +992,23 @@ async def get_watches() -> JSONResponse:
 
 @app.post("/api/watches")
 async def add_watch(req: WatchRequest) -> JSONResponse:
-    if not req.url.strip():
+    url = req.url.strip()
+    if not url:
         return JSONResponse({"error": "URL is required"}, status_code=400)
+    # Refuse duplicate watches for the same URL — two watches on one channel
+    # would download the same videos twice (and clobber each other's files).
+    if any(w.get("url", "").strip() == url for w in store.list_watches()):
+        return JSONResponse(
+            {"error": "Déjà abonné à cette chaîne"}, status_code=409
+        )
     watch = store.add_watch(
         req.url.strip(),
         req.quality or None,
         req.backfill,
         req.subfolder.strip(),
         req.date_after.strip(),
+        req.title.strip(),
+        req.thumbnail.strip(),
     )
     # Kick off an immediate first check in the background.
     threading.Thread(target=_run_watch_check, args=(watch,), daemon=True).start()
@@ -720,6 +1054,8 @@ async def update_watch(watch_id: str, req: WatchUpdate) -> JSONResponse:
         fields["quality"] = req.quality or None
     if req.subfolder is not None:
         fields["subfolder"] = req.subfolder.strip()
+    if req.date_after is not None:
+        fields["date_after"] = req.date_after.strip()
     watch = store.update_watch(watch_id, **fields)
     if watch is None:
         return JSONResponse({"error": "Unknown watch"}, status_code=404)
@@ -743,9 +1079,12 @@ async def list_jobs() -> JSONResponse:
                 "completed": j.completed,
                 "downloaded": j.downloaded,
                 "current_title": j.current_title,
+                "current_thumbnail": j.current_thumbnail,
                 "current_percent": round(j.current_percent, 1),
                 "current_speed": j.current_speed,
                 "files": j.files,
+                "playlist_title": j.playlist_title,
+                "watch_id": j.watch_id,
                 "created_at": j.created_at,
             }
             for j in jobs[:60]
@@ -851,12 +1190,133 @@ async def extract(req: ExtractRequest) -> JSONResponse:
                 "title": info.get("title") or "",
                 "uploader": info.get("uploader") or info.get("channel") or "",
                 "thumbnail": videos[0]["thumbnail"] if videos else "",
+                # The channel's round avatar (distinct from a video thumbnail).
+                # Falls back to a dedicated root-page fetch since the flat
+                # /videos listing doesn't carry the avatar.
+                "avatar": _channel_avatar(info) or _fetch_channel_avatar(req.url.strip(), log),
                 "url": req.url.strip(),
                 "count": len(entries),
                 "videos": videos,
             }
         )
     return JSONResponse({"kind": "video", **_video_dict(info)})
+
+
+@app.post("/api/channel")
+async def channel_info(req: ExtractRequest) -> JSONResponse:
+    """Lightweight channel metadata (name, avatar, counts) WITHOUT enumerating
+    the whole back-catalogue — keeps the channel card fast. The video list is
+    fetched separately/lazily via /api/extract."""
+    url = req.url.strip()
+    if not url:
+        return JSONResponse({"error": "URL requise"}, status_code=400)
+    log: list[str] = []
+    opts, temp_cookies = _common_opts(log)
+    opts["extract_flat"] = True
+    opts["playlist_items"] = "1"  # metadata only; don't list every video
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(_channel_root(url), download=False) or {}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        if temp_cookies and os.path.exists(temp_cookies):
+            os.remove(temp_cookies)
+    return JSONResponse(
+        {
+            "name": info.get("channel") or info.get("title") or "",
+            "avatar": _channel_avatar(info),
+            "url": url,
+            "subscribers": info.get("channel_follower_count"),
+            "count": info.get("playlist_count"),
+        }
+    )
+
+
+@app.post("/api/channel/videos")
+async def channel_videos(req: ChannelVideosRequest) -> JSONResponse:
+    """A single page of a channel's videos, for lazy/infinite-scroll loading.
+    Uses yt-dlp's playlist_items range so only the requested slice is fetched
+    (newest-first) instead of enumerating the whole back-catalogue."""
+    url = req.url.strip()
+    if not url:
+        return JSONResponse({"error": "URL requise"}, status_code=400)
+    # Target the /videos tab for a channel (the bare URL lists tabs, not videos).
+    target = _channel_root(url).rstrip("/") + "/videos" if _is_channel_url(url) else url
+    limit = max(1, min(req.limit, 50))
+    start = max(0, req.offset) + 1
+    end = max(0, req.offset) + limit
+    log: list[str] = []
+    opts, temp_cookies = _common_opts(log)
+    opts["extract_flat"] = "in_playlist"
+    opts["lazy_playlist"] = True
+    opts["playlist_items"] = f"{start}:{end}"
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        if temp_cookies and os.path.exists(temp_cookies):
+            os.remove(temp_cookies)
+
+    entries = [e for e in ((info or {}).get("entries") or []) if e]
+    videos = [_video_dict(e) for e in entries]
+    return JSONResponse(
+        {
+            "videos": videos,
+            "offset": req.offset,
+            "limit": limit,
+            # If we got a full page, assume there may be more.
+            "has_more": len(videos) >= limit,
+        }
+    )
+
+
+@app.post("/api/search")
+async def search(req: SearchRequest) -> JSONResponse:
+    """Search YouTube by free text and return matching videos plus the distinct
+    channels behind them, so the user can pick a video or follow a creator
+    without knowing the URL."""
+    q = req.query.strip()
+    if not q:
+        return JSONResponse({"error": "Recherche vide"}, status_code=400)
+    limit = max(1, min(req.limit, 30))
+    log: list[str] = []
+    opts, temp_cookies = _common_opts(log)
+    opts["extract_flat"] = True
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    finally:
+        if temp_cookies and os.path.exists(temp_cookies):
+            os.remove(temp_cookies)
+
+    entries = [e for e in ((info or {}).get("entries") or []) if e]
+    videos = [_video_dict(e) for e in entries]
+
+    # Distinct channels behind the results, in first-seen order. Flat entries
+    # don't always include channel_url, so fall back to the channel_id.
+    channels: dict[str, dict[str, str]] = {}
+    for e in entries:
+        cid = e.get("channel_id")
+        url = (
+            e.get("channel_url")
+            or e.get("uploader_url")
+            or (f"https://www.youtube.com/channel/{cid}" if cid else "")
+        )
+        name = e.get("channel") or e.get("uploader") or ""
+        if url and url not in channels:
+            channels[url] = {"name": name or url, "url": url}
+    return JSONResponse(
+        {
+            "query": q,
+            "videos": videos,
+            "channels": list(channels.values())[:6],
+        }
+    )
 
 
 # Mounted LAST so the API routes above take precedence; serves the built React

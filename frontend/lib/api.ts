@@ -4,6 +4,7 @@
 import { backend, qualityToBackend, type ExtractedVideo } from "./backend"
 import type {
   ChannelPreview,
+  ChannelResult,
   PlaylistPreview,
   UrlKind,
   VideoPreview,
@@ -36,14 +37,35 @@ export function detectSource(url: string): string {
   }
 }
 
-function toPreview(v: ExtractedVideo): VideoPreview {
+/**
+ * A bare channel URL (e.g. ".../@name") extracts to the channel's *tabs*
+ * (Videos / Shorts / Playlists) — which all share the channel id and aren't
+ * individual videos. Target the Videos tab so we list real, uniquely-id'd
+ * videos instead.
+ */
+function channelVideosUrl(url: string): string {
+  const TABS = ["videos", "shorts", "streams", "playlists", "featured", "community"]
+  try {
+    const u = new URL(url.trim())
+    const segs = u.pathname.replace(/\/+$/, "").split("/").filter(Boolean)
+    if (segs.some((s) => TABS.includes(s.toLowerCase()))) return url.trim()
+    u.pathname = `${u.pathname.replace(/\/+$/, "")}/videos`
+    return u.toString()
+  } catch {
+    return url
+  }
+}
+
+function toPreview(v: ExtractedVideo, index = 0): VideoPreview {
   return {
-    id: v.id || (typeof crypto !== "undefined" ? crypto.randomUUID() : String(Math.random())),
+    // Guarantee a unique selection key even if the backend repeats/omits ids.
+    id: v.id ? `${v.id}-${index}` : `v-${index}`,
     title: v.title || "Sans titre",
     thumbnail: v.thumbnail || "/placeholder.svg",
     duration: v.duration || "",
     channel: v.channel || "",
     source: v.source || detectSource(v.url || ""),
+    url: v.url || undefined,
     uploaded: v.uploaded || undefined,
   }
 }
@@ -57,23 +79,55 @@ export async function fetchUrlMetadata(url: string): Promise<VideoPreview> {
   return toPreview(d)
 }
 
+/** Métadonnées légères d'une chaîne (nom, logo, compteurs) — SANS énumérer
+ *  toutes ses vidéos, pour un affichage rapide de la fiche. */
+export async function fetchChannelInfo(channelUrl: string): Promise<ChannelPreview> {
+  const d = await backend.channelInfo(channelUrl)
+  if (d.error) throw new Error(d.error)
+  const fmtCount = (n?: number | null) =>
+    typeof n === "number" ? n.toLocaleString("fr-FR") : "—"
+  return {
+    id: channelUrl,
+    name: d.name || "Chaîne",
+    avatar: d.avatar || "",
+    url: channelUrl,
+    subscribers: fmtCount(d.subscribers),
+    videoCount: typeof d.count === "number" ? d.count : 0,
+    description: "",
+  }
+}
+
 /** Récupère l'aperçu d'une chaîne et ses dernières vidéos. */
 export async function fetchChannelVideos(
   channelUrl: string,
 ): Promise<{ channel: ChannelPreview; videos: VideoPreview[] }> {
-  const d = await backend.extract(channelUrl)
+  const d = await backend.extract(channelVideosUrl(channelUrl))
   if (d.error) throw new Error(d.error)
   const videos = (d.videos ?? []).map(toPreview)
   const channel: ChannelPreview = {
     id: channelUrl,
     name: d.title || d.uploader || "Chaîne",
-    avatar: d.thumbnail || "",
+    avatar: d.avatar || "",
     url: channelUrl,
     subscribers: "—",
     videoCount: d.count ?? videos.length,
     description: d.uploader || "",
   }
   return { channel, videos }
+}
+
+/** Une page de vidéos d'une chaîne (scroll infini / chargement paresseux). */
+export async function fetchChannelVideosPage(
+  channelUrl: string,
+  offset: number,
+  limit = 30,
+): Promise<{ videos: VideoPreview[]; hasMore: boolean }> {
+  const d = await backend.channelVideos(channelUrl, offset, limit)
+  if (d.error) throw new Error(d.error)
+  return {
+    videos: (d.videos ?? []).map((v, i) => toPreview(v, offset + i)),
+    hasMore: !!d.has_more,
+  }
 }
 
 /** Récupère les vidéos d'une playlist. */
@@ -92,6 +146,18 @@ export async function fetchPlaylistVideos(
     videoCount: d.count ?? videos.length,
   }
   return { playlist, videos }
+}
+
+/** Recherche YouTube par texte libre : renvoie des vidéos et les chaînes. */
+export async function searchYoutube(
+  query: string,
+): Promise<{ videos: VideoPreview[]; channels: ChannelResult[] }> {
+  const d = await backend.search(query)
+  if (d.error) throw new Error(d.error)
+  return {
+    videos: (d.videos ?? []).map(toPreview),
+    channels: (d.channels ?? []).map((c) => ({ name: c.name, url: c.url })),
+  }
 }
 
 export interface StartDownloadOptions {

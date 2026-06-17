@@ -14,9 +14,12 @@ export interface BackendJob {
   completed: number
   downloaded: number
   current_title: string
+  current_thumbnail?: string
   current_percent: number
   current_speed: string
   files: string[]
+  playlist_title?: string
+  watch_id?: string | null
   created_at: number
 }
 
@@ -27,6 +30,7 @@ export interface BackendWatch {
   subfolder?: string
   date_after?: string
   title: string
+  thumbnail?: string | null
   enabled: boolean
   backfill: boolean
   synced?: number
@@ -39,6 +43,7 @@ export interface BackendSettings {
   default_quality: string
   watch_interval_minutes: number
   organize: string
+  max_concurrent: number
   download_dir: string
   qualities: string[]
 }
@@ -66,8 +71,33 @@ export interface ExtractedVideo {
 export interface ExtractResult extends ExtractedVideo {
   kind: "video" | "playlist"
   uploader?: string
+  avatar?: string
   count?: number
   videos?: ExtractedVideo[]
+  error?: string
+}
+
+export interface SearchResult {
+  query: string
+  videos: ExtractedVideo[]
+  channels: { name: string; url: string }[]
+  error?: string
+}
+
+export interface ChannelInfoResult {
+  name: string
+  avatar: string
+  url: string
+  subscribers?: number | null
+  count?: number | null
+  error?: string
+}
+
+export interface ChannelVideosResult {
+  videos: ExtractedVideo[]
+  offset: number
+  limit: number
+  has_more: boolean
   error?: string
 }
 
@@ -85,6 +115,10 @@ export const backend = {
   download: (b: { url: string; quality: string; format: string; subfolder?: string }) =>
     call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
   extract: (url: string) => call<ExtractResult>("POST", "/api/extract", { url }),
+  channelInfo: (url: string) => call<ChannelInfoResult>("POST", "/api/channel", { url }),
+  channelVideos: (url: string, offset: number, limit: number) =>
+    call<ChannelVideosResult>("POST", "/api/channel/videos", { url, offset, limit }),
+  search: (query: string) => call<SearchResult>("POST", "/api/search", { query }),
   watches: () => call<BackendWatch[]>("GET", "/api/watches"),
   addWatch: (b: {
     url: string
@@ -92,20 +126,32 @@ export const backend = {
     backfill: boolean
     subfolder: string
     date_after: string
+    title?: string
+    thumbnail?: string
   }) => call<BackendWatch & { error?: string }>("POST", "/api/watches", b),
-  patchWatch: (id: string, b: Partial<{ enabled: boolean; quality: string; subfolder: string }>) =>
-    call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
+  patchWatch: (
+    id: string,
+    b: Partial<{ enabled: boolean; quality: string; subfolder: string; date_after: string }>,
+  ) => call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
   removeWatch: (id: string) => call<{ removed: boolean }>("DELETE", `/api/watches/${id}`),
   checkWatch: (id: string) => call<{ status: string }>("POST", `/api/watches/${id}/check`),
   settings: () => call<BackendSettings>("GET", "/api/settings"),
-  saveSettings: (b: Partial<{ default_quality: string; watch_interval_minutes: number; organize: string }>) =>
-    call<BackendSettings>("POST", "/api/settings", b),
+  saveSettings: (
+    b: Partial<{
+      default_quality: string
+      watch_interval_minutes: number
+      organize: string
+      max_concurrent: number
+    }>,
+  ) => call<BackendSettings>("POST", "/api/settings", b),
   files: () => call<BackendFile[]>("GET", "/api/files"),
 }
 
 // --- quality label mapping (frontend <-> backend) ---
 const Q_TO_BACKEND: Record<string, string> = {
   Auto: "best",
+  "2160p (4K)": "2160",
+  "1440p": "1440",
   "1080p": "1080",
   "720p": "720",
   "480p": "480",
@@ -113,14 +159,16 @@ const Q_TO_BACKEND: Record<string, string> = {
 }
 const Q_TO_FRONTEND: Record<string, string> = {
   best: "Auto",
-  "2160": "1080p",
-  "1440": "1080p",
+  "2160": "2160p (4K)",
+  "1440": "1440p",
   "1080": "1080p",
   "720": "720p",
   "480": "480p",
   audio: "Audio seul",
 }
 
+const FRONTEND_QUALITIES = ["Auto", "2160p (4K)", "1440p", "1080p", "720p", "480p", "Audio seul"]
+
 export const qualityToBackend = (q: string) => Q_TO_BACKEND[q] ?? q
 export const qualityToFrontend = (q: string | null | undefined) =>
-  (q && (Q_TO_FRONTEND[q] ?? (["Auto", "1080p", "720p", "480p", "Audio seul"].includes(q) ? q : "Auto"))) || "Auto"
+  (q && (Q_TO_FRONTEND[q] ?? (FRONTEND_QUALITIES.includes(q) ? q : "Auto"))) || "Auto"

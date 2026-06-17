@@ -4,10 +4,13 @@ import { useMemo, useState } from "react"
 import {
   BellPlusIcon,
   DownloadIcon,
+  Loader2Icon,
   RadioIcon,
   UsersIcon,
 } from "lucide-react"
 import { toast } from "sonner"
+
+import { fetchChannelVideos } from "@/lib/api"
 
 import { cn } from "@/lib/utils"
 import type {
@@ -16,7 +19,8 @@ import type {
   Subscription,
   VideoPreview,
 } from "@/lib/types"
-import { useStore } from "@/components/store-provider"
+import { useStore, type BackfillOptions } from "@/components/store-provider"
+import { FollowDialog } from "@/components/follow-dialog"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -41,10 +45,31 @@ type Props =
   | (BaseProps & { type: "playlist"; playlist: PlaylistPreview; channel?: never })
 
 export function ChannelVideoList(props: Props) {
-  const { videos, url, quality, format, onQuality, onFormat } = props
+  const { url, quality, format, onQuality, onFormat } = props
   const { addDownload, addSubscription } = useStore()
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [page, setPage] = useState(1)
+  // A channel shouldn't dump its whole back-catalogue: keep the videos behind a
+  // toggle, AND don't fetch them until the user asks. Playlists arrive with
+  // their videos already loaded and stay expanded.
+  const collapsible = props.type === "channel"
+  const [showVideos, setShowVideos] = useState(!collapsible)
+  const [followOpen, setFollowOpen] = useState(false)
+  const [videos, setVideos] = useState<VideoPreview[]>(props.videos)
+  const [loadingVideos, setLoadingVideos] = useState(false)
+
+  async function expand() {
+    setShowVideos(true)
+    if (videos.length === 0 && props.type === "channel") {
+      setLoadingVideos(true)
+      try {
+        const res = await fetchChannelVideos(url)
+        setVideos(res.videos)
+      } finally {
+        setLoadingVideos(false)
+      }
+    }
+  }
 
   const visible = useMemo(() => videos.slice(0, page * PAGE_SIZE), [videos, page])
   const allVisibleSelected =
@@ -76,7 +101,8 @@ export function ChannelVideoList(props: Props) {
     const chosen = videos.filter((v) => selected.has(v.id))
     chosen.forEach((v) =>
       addDownload({
-        url,
+        // Download the individual video by its own URL, not the channel/playlist.
+        url: v.url || url,
         title: v.title,
         thumbnail: v.thumbnail,
         quality,
@@ -88,14 +114,15 @@ export function ChannelVideoList(props: Props) {
     setSelected(new Set())
   }
 
-  function follow() {
-    const name = props.type === "channel" ? props.channel.name : props.playlist.title
+  const followName = props.type === "channel" ? props.channel.name : props.playlist.title
+
+  function follow(opts: BackfillOptions) {
     const avatar =
       props.type === "channel" ? props.channel.avatar : props.playlist.thumbnail
     const sub: Subscription = {
       id: `s-${Date.now()}`,
       type: props.type,
-      name,
+      name: followName,
       avatar,
       url,
       checkIntervalHours: 12,
@@ -110,7 +137,7 @@ export function ChannelVideoList(props: Props) {
       defaultQuality: quality,
       defaultFormat: format,
     }
-    addSubscription(sub)
+    addSubscription(sub, opts)
   }
 
   return (
@@ -126,14 +153,18 @@ export function ChannelVideoList(props: Props) {
             <div className="min-w-0 flex-1">
               <h3 className="truncate text-lg font-semibold">{props.channel.name}</h3>
               <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span className="flex items-center gap-1">
-                  <UsersIcon className="size-3.5" />
-                  {props.channel.subscribers} abonnés
-                </span>
-                <span>{props.channel.videoCount} vidéos</span>
+                {props.channel.subscribers !== "—" && (
+                  <span className="flex items-center gap-1">
+                    <UsersIcon className="size-3.5" />
+                    {props.channel.subscribers} abonnés
+                  </span>
+                )}
+                {props.channel.videoCount > 0 && (
+                  <span>{props.channel.videoCount} vidéos</span>
+                )}
               </div>
             </div>
-            <Button variant="outline" onClick={follow}>
+            <Button variant="outline" onClick={() => setFollowOpen(true)}>
               <BellPlusIcon data-icon="inline-start" />
               Watch / Suivre
             </Button>
@@ -155,34 +186,49 @@ export function ChannelVideoList(props: Props) {
                 <span>{props.playlist.videoCount} vidéos</span>
               </div>
             </div>
-            <Button variant="outline" onClick={follow}>
+            <Button variant="outline" onClick={() => setFollowOpen(true)}>
               <BellPlusIcon data-icon="inline-start" />
               Watch / Suivre
             </Button>
           </div>
         )}
 
-        <Separator />
-
-        {/* Selection toolbar */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={allVisibleSelected} onCheckedChange={toggleAll} />
-            <span>
-              {selected.size > 0 ? `${selected.size} sélectionnée(s)` : "Tout sélectionner"}
-            </span>
-          </label>
-          <div className="flex items-center gap-2">
-            <QualitySelect value={quality} onChange={onQuality} size="sm" />
-            <FormatSelect value={format} onChange={onFormat} size="sm" />
-            <Button onClick={downloadSelected} disabled={selected.size === 0}>
-              <DownloadIcon data-icon="inline-start" />
-              Télécharger ({selected.size})
-            </Button>
+        {collapsible && !showVideos ? (
+          <Button variant="outline" className="w-full" onClick={expand}>
+            <DownloadIcon data-icon="inline-start" />
+            Voir les vidéos à télécharger
+          </Button>
+        ) : loadingVideos ? (
+          <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2Icon className="size-4 animate-spin" />
+            Chargement des vidéos…
           </div>
-        </div>
+        ) : (
+          <>
+            <Separator />
+
+            {/* Selection toolbar */}
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox checked={allVisibleSelected} onCheckedChange={toggleAll} />
+                <span>
+                  {selected.size > 0 ? `${selected.size} sélectionnée(s)` : "Tout sélectionner"}
+                </span>
+              </label>
+              <div className="flex items-center gap-2">
+                <QualitySelect value={quality} onChange={onQuality} size="sm" />
+                <FormatSelect value={format} onChange={onFormat} size="sm" />
+                <Button onClick={downloadSelected} disabled={selected.size === 0}>
+                  <DownloadIcon data-icon="inline-start" />
+                  Télécharger ({selected.size})
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
       </CardHeader>
 
+      {showVideos && !loadingVideos && videos.length > 0 && (
       <CardContent className="flex flex-col gap-2">
         {visible.map((v) => {
           const isSel = selected.has(v.id)
@@ -238,6 +284,14 @@ export function ChannelVideoList(props: Props) {
           </Button>
         )}
       </CardContent>
+      )}
+
+      <FollowDialog
+        open={followOpen}
+        onOpenChange={setFollowOpen}
+        channelName={followName}
+        onConfirm={follow}
+      />
     </Card>
   )
 }
