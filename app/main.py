@@ -10,6 +10,8 @@ to avoid re-downloading what is already on disk.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
 import shutil
 import tempfile
@@ -378,7 +380,7 @@ def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int
                 "outtmpl": _outtmpl(job.dest),
                 "noplaylist": True,
                 "progress_hooks": [hook],
-                "concurrent_fragment_downloads": 4,
+                "concurrent_fragment_downloads": 2,
                 "allow_playlist_files": False,
                 **_format_opts(job.quality, job.fmt),
             }
@@ -398,6 +400,7 @@ def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int
                     job.files.append(Path(final).name)
                     job.downloaded += 1
                 job.log.append(f"Downloaded: {title}")
+                _drop_file_cache(final)
                 status = "downloaded"
             else:
                 job.log.append(f"Skipped: {title}")
@@ -558,6 +561,7 @@ def _run_job(job: Job) -> None:
                         job.files.append(Path(final).name)
                         job.downloaded += 1
                         job.log.append(f"Downloaded: {entry.get('title', '')}")
+                        _drop_file_cache(final)
                 except Exception as exc:  # noqa: BLE001
                     job.log.append(f"Failed: {entry.get('title', '')} ({exc})")
                     if "Requested format" in str(exc):
@@ -574,6 +578,9 @@ def _run_job(job: Job) -> None:
     finally:
         if temp_cookies and os.path.exists(temp_cookies):
             os.remove(temp_cookies)
+        # Return the heap freed by this download/extraction to the OS so idle
+        # RSS doesn't stay inflated after a backfill.
+        _release_memory()
 
 
 # --- Watches ---------------------------------------------------------------
@@ -668,6 +675,57 @@ def _set_download_concurrency(n: int) -> None:
     global _DL_GATE
     with _DL_GATE_LOCK:
         _DL_GATE = threading.Semaphore(max(1, min(int(n), 10)))
+
+
+_LIBC = None
+try:
+    _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=False)
+except Exception:  # noqa: BLE001
+    _LIBC = None
+
+
+def _release_memory() -> None:
+    """Hand freed heap back to the OS. After a big extraction/download CPython
+    keeps the arena, so the container's RSS stays inflated (looks like a leak)
+    even when idle. malloc_trim() returns the unused pages to the kernel."""
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _drop_file_cache(path: str) -> None:
+    """Evict a just-downloaded file from the page cache. Writing big videos fills
+    the kernel cache, which the NAS reports as (reclaimable) container memory and
+    which lingers as long as there's free RAM. We won't re-read the file, so tell
+    the kernel to drop it — keeps reported memory from staying inflated."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except (OSError, AttributeError):  # AttributeError: non-Linux (no fadvise)
+        pass
+
+
+_MAX_JOBS = 300
+
+
+def _prune_jobs() -> None:
+    """Keep the in-memory job map bounded by dropping the oldest finished jobs,
+    so a long-running instance with many watches doesn't grow without limit."""
+    with JOBS_LOCK:
+        excess = len(JOBS) - _MAX_JOBS
+        if excess <= 0:
+            return
+        finished = sorted(
+            (j for j in JOBS.values() if j.status in ("done", "error")),
+            key=lambda j: j.created_at,
+        )
+        for j in finished[:excess]:
+            JOBS.pop(j.id, None)
 
 
 def _run_job_gated(job: Job) -> None:
@@ -849,6 +907,7 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
         with JOBS_LOCK:
             JOBS[job.id] = job
         jobs.append(job)
+    _prune_jobs()
 
     for future in [_DOWNLOAD_POOL.submit(_run_job_gated, j) for j in jobs]:
         try:
@@ -864,6 +923,7 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
         thumbnail=_fetch_channel_avatar(watch["url"], log) or watch.get("thumbnail", ""),
         last_result=f"{downloaded} new" if downloaded else "up to date",
     )
+    _release_memory()  # free the heap used by enumeration/scan extractions
 
 
 def _scheduler_loop() -> None:
@@ -935,6 +995,7 @@ async def start_download(req: DownloadRequest) -> JSONResponse:
     )
     with JOBS_LOCK:
         JOBS[job.id] = job
+    _prune_jobs()
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
     return JSONResponse({"job_id": job.id})
 

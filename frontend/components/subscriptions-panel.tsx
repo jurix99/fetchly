@@ -1,9 +1,10 @@
 "use client"
 
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import {
   BellIcon,
   ClockIcon,
+  ListFilterIcon,
   ListVideoIcon,
   RefreshCwIcon,
   SettingsIcon,
@@ -21,7 +22,20 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { SubscriptionEditor } from "@/components/subscription-editor"
+
+type SortKey = "recent" | "alpha"
 
 function timeAgo(iso: string) {
   const diff = Date.now() - new Date(iso).getTime()
@@ -40,6 +54,24 @@ export function SubscriptionsPanel() {
     removeSubscription,
   } = useStore()
   const [editing, setEditing] = useState<Subscription | null>(null)
+  const [sort, setSort] = useState<SortKey>("recent")
+  const [showChannels, setShowChannels] = useState(true)
+  const [showPlaylists, setShowPlaylists] = useState(true)
+
+  const visible = useMemo(() => {
+    const filtered = subscriptions.filter((sub) =>
+      sub.type === "channel" ? showChannels : showPlaylists
+    )
+    if (sort === "alpha") {
+      return [...filtered].sort((a, b) =>
+        a.name.localeCompare(b.name, "fr", { sensitivity: "base" })
+      )
+    }
+    // "recent": most recently checked first.
+    return [...filtered].sort(
+      (a, b) => new Date(b.lastChecked).getTime() - new Date(a.lastChecked).getTime()
+    )
+  }, [subscriptions, sort, showChannels, showPlaylists])
 
   if (subscriptions.length === 0) {
     return (
@@ -60,7 +92,73 @@ export function SubscriptionsPanel() {
 
   return (
     <div className="flex flex-col gap-3">
-      {subscriptions.map((sub) => {
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">
+          {visible.length} sur {subscriptions.length} abonnement{subscriptions.length > 1 ? "s" : ""}
+        </span>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button size="sm" variant="outline">
+                <ListFilterIcon data-icon="inline-start" />
+                Trier &amp; filtrer
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="end" className="w-52">
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>Trier</DropdownMenuLabel>
+              <DropdownMenuRadioGroup
+                value={sort}
+                onValueChange={(v) => setSort(v as SortKey)}
+              >
+                <DropdownMenuRadioItem value="recent">
+                  Récents
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="alpha">
+                  Ordre alphabétique
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>Afficher</DropdownMenuLabel>
+              <DropdownMenuCheckboxItem
+                checked={showChannels}
+                onCheckedChange={(c) => setShowChannels(c)}
+                closeOnClick={false}
+              >
+                <TvIcon />
+                Chaînes
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showPlaylists}
+                onCheckedChange={(c) => setShowPlaylists(c)}
+                closeOnClick={false}
+              >
+                <ListVideoIcon />
+                Playlists
+              </DropdownMenuCheckboxItem>
+            </DropdownMenuGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {visible.length === 0 ? (
+        <Empty className="border">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <ListFilterIcon />
+            </EmptyMedia>
+            <EmptyTitle>Aucun résultat</EmptyTitle>
+            <EmptyDescription>
+              Aucun abonnement ne correspond au filtre sélectionné.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : null}
+
+      {visible.map((sub) => {
         const prog = watchProgress[sub.id]
         return (
         <Card key={sub.id} className={cn(!sub.active && "opacity-70")}>
