@@ -1,0 +1,71 @@
+# Fetchly — Synology / Portainer stack
+# -------------------------------------
+# Portainer > Stacks > Add stack > Web editor > paste this.
+#
+# BEFORE deploying:
+#  1. Find your NAS user's IDs (SSH into the NAS):  id your_user
+#       -> set PUID / PGID below (Synology: often uid 1026, gid 100 "users").
+#  2. Create the host folders (File Station or SSH):
+#       /volume1/docker/fetchly/downloads
+#       /volume1/docker/fetchly/config
+#       /volume1/docker/fetchly/cookies        (optional, for cookies.txt)
+#  3. Make sure the image exists / is pullable (see notes at the bottom).
+
+services:
+  fetchly:
+    image: ghcr.io/jurix99/fetchly:0.1.0      # or :latest
+    container_name: fetchly
+    ports:
+      - "6776:6776"                            # http://<nas-ip>:6776
+    environment:
+      - PUID=1026                              # <-- `id your_user` on the NAS
+      - PGID=100                               # <-- "users" group is usually 100
+      - TZ=Europe/Paris
+      - UMASK=022
+      # Caps glibc memory arenas — keeps idle RAM low for this threaded app.
+      - MALLOC_ARENA_MAX=2
+      - POT_PROVIDER_URL=http://bgutil-provider:4416
+    volumes:
+      - /volume1/docker/fetchly/downloads:/downloads
+      - /volume1/docker/fetchly/config:/config
+      - /volume1/docker/fetchly/cookies:/cookies:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6776/api/settings', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # Cap RAM so big downloads (page cache + ffmpeg/Deno) can't eat the NAS.
+    # The kernel reclaims file cache automatically under this ceiling.
+    mem_limit: 2g
+    mem_reservation: 512m
+    depends_on:
+      - bgutil-provider
+    restart: unless-stopped
+
+  # Generates the YouTube PO tokens yt-dlp needs for many videos.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    init: true
+    mem_limit: 512m
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------------
+# Getting the image onto the NAS — pick one:
+#
+#  A) Publish via CI, then Portainer pulls it
+#     - Push a git tag v0.1.0 (the docker-release workflow publishes
+#       ghcr.io/jurix99/fetchly:0.1.0 to GHCR), or push to main for :latest.
+#     - If the GHCR package is PRIVATE, add a registry in Portainer
+#       (Registries > Add > Custom, ghcr.io, username + a GitHub PAT with
+#       read:packages) so the stack can pull it. Public packages need no auth.
+#
+#  B) Build locally, ship the image (no registry)
+#     On your build machine:
+#       docker build -t fetchly:0.1.0 .
+#       docker save fetchly:0.1.0 | gzip > fetchly_0.1.0.tar.gz
+#     Copy the file to the NAS, then (SSH):
+#       sudo docker load < /volume1/docker/fetchly_0.1.0.tar.gz
+#     and set  image: fetchly:0.1.0  above (no registry prefix).
+# ---------------------------------------------------------------------------

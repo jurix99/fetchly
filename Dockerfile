@@ -71,12 +71,16 @@ RUN mkdir -p /downloads /config
 VOLUME ["/downloads", "/config"]
 
 # NAS-friendly defaults; override per-deployment (see docker-compose.yml).
+# MALLOC_ARENA_MAX caps glibc's per-thread memory arenas — without it a
+# multithreaded Python app's RSS balloons (each thread gets its own arena that
+# never shrinks), which is the main reason the idle container looked huge.
 ENV PUID=1000 \
     PGID=1000 \
     UMASK=022 \
     TZ=Etc/UTC \
     DOWNLOAD_DIR=/downloads \
-    CONFIG_DIR=/config
+    CONFIG_DIR=/config \
+    MALLOC_ARENA_MAX=2
 
 # Runtime entrypoint remaps the user to PUID/PGID and drops privileges via gosu.
 # strip CR in case the script was checked out with Windows line endings.
