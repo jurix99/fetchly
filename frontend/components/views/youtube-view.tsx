@@ -2,12 +2,17 @@
 
 import { useEffect, useState } from "react"
 import {
+  BellPlusIcon,
+  ClockIcon,
   DownloadIcon,
   Loader2Icon,
+  RssIcon,
   SearchIcon,
+  ThumbsUpIcon,
   TvIcon,
   VideoIcon,
 } from "lucide-react"
+import { toast } from "sonner"
 
 import {
   detectUrlKind,
@@ -23,6 +28,7 @@ import type {
   UrlKind,
   VideoPreview,
 } from "@/lib/types"
+import { backend } from "@/lib/backend"
 import { useStore } from "@/components/store-provider"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
@@ -37,6 +43,7 @@ import { Separator } from "@/components/ui/separator"
 import { ChannelVideoList } from "@/components/channel-video-list"
 import { ChannelDialog } from "@/components/channel-dialog"
 import { SubscriptionsPanel } from "@/components/subscriptions-panel"
+import { SubscriptionsPicker } from "@/components/subscriptions-picker"
 
 type Result =
   | { kind: "video"; video: VideoPreview }
@@ -81,14 +88,17 @@ export function YoutubeView() {
     setDetected(detectUrlKind(value))
   }
 
-  async function run(input?: string) {
+  // forceKind lets the "Mon YouTube" tiles load a special source (e.g.
+  // ":ytsubscriptions") that the URL sniffer wouldn't classify on its own.
+  // limit bounds enumeration for unbounded feeds (the subscriptions firehose).
+  async function run(input?: string, forceKind?: UrlKind, limit?: number) {
     const q = (input ?? url).trim()
     if (!q) return
     if (input !== undefined) {
       setUrl(input)
-      setDetected(detectUrlKind(input))
+      setDetected(forceKind ?? detectUrlKind(input))
     }
-    const kind = detectUrlKind(q)
+    const kind = forceKind ?? detectUrlKind(q)
     setLoading(true)
     setResult(null)
     try {
@@ -97,7 +107,7 @@ export function YoutubeView() {
         const channel = await fetchChannelInfo(q)
         setResult({ kind: "channel", channel, videos: [] })
       } else if (kind === "playlist") {
-        const { playlist, videos } = await fetchPlaylistVideos(q)
+        const { playlist, videos } = await fetchPlaylistVideos(q, limit)
         setResult({ kind: "playlist", playlist, videos })
       } else if (kind === "video") {
         const video = await fetchUrlMetadata(q)
@@ -107,6 +117,15 @@ export function YoutubeView() {
         const { videos, channels } = await searchYoutube(q)
         setResult({ kind: "search", videos, channels })
       }
+    } catch (e) {
+      // Most "Mon YouTube" failures are missing/expired cookies — guide the user.
+      toast.error(
+        e instanceof Error && /cookie|sign in|login|private/i.test(e.message)
+          ? "Connexion YouTube requise — ajoute tes cookies dans Réglages."
+          : e instanceof Error
+            ? e.message
+            : "Échec du chargement",
+      )
     } finally {
       setLoading(false)
     }
@@ -141,6 +160,8 @@ export function YoutubeView() {
         </TabsList>
 
         <TabsContent value="explore" className="flex flex-col gap-6">
+          <MyYoutube onPick={run} disabled={loading} />
+
           <Card>
             <CardHeader>
               <CardTitle className="text-base">
@@ -298,6 +319,180 @@ export function YoutubeView() {
         onOpenChange={(o) => !o && setChannelDialog(null)}
       />
     </div>
+  )
+}
+
+// One-click access to the signed-in user's own YouTube lists. These resolve via
+// yt-dlp using the stored cookies — no URL to paste. Watch Later / Liked are the
+// strongest "download intent" sources; subscriptions is the recent uploads feed.
+type MySource = {
+  key: string
+  label: string
+  hint: string
+  url: string
+  kind: UrlKind
+  limit?: number
+  Icon: typeof ClockIcon
+  follow?: boolean // show a "Suivre" action (auto-sync new items) for this list
+  importSubs?: boolean // show an "Importer" action (follow every subscription)
+}
+
+const MY_SOURCES: MySource[] = [
+  {
+    key: "wl",
+    label: "À regarder plus tard",
+    hint: "Ta playlist Watch Later",
+    url: "https://www.youtube.com/playlist?list=WL",
+    kind: "playlist",
+    Icon: ClockIcon,
+    follow: true,
+  },
+  {
+    key: "ll",
+    label: "Vidéos likées",
+    hint: "Tout ce que tu as aimé",
+    url: "https://www.youtube.com/playlist?list=LL",
+    kind: "playlist",
+    Icon: ThumbsUpIcon,
+    follow: true,
+  },
+  {
+    key: "subs",
+    label: "Abonnements",
+    hint: "50 uploads récents · ou tout importer",
+    url: ":ytsubscriptions",
+    kind: "playlist",
+    // The subscriptions feed is every upload from every sub — bound it or it
+    // paginates forever.
+    limit: 50,
+    Icon: RssIcon,
+    importSubs: true,
+  },
+]
+
+function MyYoutube({
+  onPick,
+  disabled,
+}: {
+  onPick: (url: string, kind: UrlKind, limit?: number) => void
+  disabled?: boolean
+}) {
+  const [hasCookies, setHasCookies] = useState<boolean | null>(null)
+  const [following, setFollowing] = useState<string | null>(null)
+  const [pickerOpen, setPickerOpen] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    backend
+      .cookies()
+      .then((c) => !cancelled && setHasCookies(!!c.present))
+      .catch(() => !cancelled && setHasCookies(false))
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  async function follow(src: MySource) {
+    setFollowing(src.key)
+    try {
+      // backfill OFF: only sync items added from now on (downloading the entire
+      // current list — e.g. all liked videos — could be huge). Use "Voir" to
+      // grab what's already in the list.
+      const res = await backend.addWatch({
+        url: src.url,
+        quality: "",
+        backfill: false,
+        subfolder: "",
+        date_after: "",
+        title: src.label,
+      })
+      if (res.error) toast.error(res.error)
+      else
+        toast.success(
+          `Abonné · « ${src.label} » : les nouvelles vidéos se téléchargeront seules (les actuelles via « Voir »).`,
+        )
+    } catch {
+      toast.error("Échec de l'abonnement")
+    } finally {
+      setFollowing(null)
+    }
+  }
+
+  // Hidden entirely until we know the cookie state, to avoid a flash.
+  if (hasCookies === null) return null
+
+  return (
+    <>
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Mon YouTube</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {!hasCookies && (
+          <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
+            Connecte ton compte en ajoutant tes cookies dans{" "}
+            <span className="font-medium text-foreground">Réglages → Cookies YouTube</span>{" "}
+            pour accéder à ta liste « À regarder plus tard », tes vidéos likées et tes
+            abonnements.
+          </p>
+        )}
+        <div className="flex flex-col gap-2">
+          {MY_SOURCES.map((src) => {
+            const { key, label, hint, url, kind, limit, Icon } = src
+            return (
+              <div
+                key={key}
+                className="flex items-center gap-3 rounded-lg border border-border bg-card px-3 py-2.5"
+              >
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
+                  <Icon className="size-4" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{label}</p>
+                  <p className="truncate text-xs text-muted-foreground">{hint}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={disabled || !hasCookies}
+                    onClick={() => onPick(url, kind, limit)}
+                  >
+                    Voir
+                  </Button>
+                  {src.follow && (
+                    <Button
+                      size="sm"
+                      disabled={!hasCookies || following === key}
+                      onClick={() => void follow(src)}
+                    >
+                      {following === key ? (
+                        <Loader2Icon className="size-4 animate-spin" />
+                      ) : (
+                        <BellPlusIcon className="size-4" />
+                      )}
+                      Suivre
+                    </Button>
+                  )}
+                  {src.importSubs && (
+                    <Button
+                      size="sm"
+                      disabled={!hasCookies}
+                      onClick={() => setPickerOpen(true)}
+                    >
+                      <BellPlusIcon className="size-4" />
+                      Choisir…
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </CardContent>
+    </Card>
+    <SubscriptionsPicker open={pickerOpen} onOpenChange={setPickerOpen} />
+    </>
   )
 }
 

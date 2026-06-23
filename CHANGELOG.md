@@ -5,12 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - 2026-06-17
+## [Unreleased]
 
-Search, an interactive channel browser, 4K, parallel subscription downloads, and
-first-class NAS deployment.
+## [0.0.2] - 2026-06-22
 
 ### Added
+
+- **Media options now actually apply** — the Settings toggles that were
+  cosmetic are wired to yt-dlp: **bandwidth limit** (`ratelimit`), **subtitles**
+  (download + optional embed, configurable languages), **SponsorBlock**
+  (skip or mark), **embed thumbnail / metadata / chapters**, and the **download
+  archive** toggle (manual downloads skip already-grabbed files). Persisted in
+  config and applied on every download.
+- **Disk space guard** — Settings shows the downloads volume usage and a
+  **minimum free space** threshold. Below it, the backend refuses to start
+  downloads (manual *and* scheduled) with a 507 and fires a one-shot
+  notification, so a full disk can't silently break things. New endpoint:
+  `GET /api/disk`.
+- **More notification events** — besides "video downloaded", you can now be
+  alerted on **failures** and get a single **playlist/batch digest** instead of
+  one message per video (each toggleable in Settings → Notifications). Disk-low
+  alerts reuse the same channels.
+- **Jellyfin / Plex metadata** — enable *Métadonnées Jellyfin / Plex* in
+  Settings and each download gets a Kodi-style `.nfo` (title, description,
+  channel as studio/director, upload date, genres, tags, runtime, YouTube id,
+  poster) plus a `-poster.jpg` next to the file. Read natively by Jellyfin and
+  by Plex via the NFO agent, so your downloads show up as proper library items.
+  Applies to new downloads.
+
+- **Download notifications** — get alerted whenever a video finishes
+  downloading, on any channel supported by [Apprise](https://github.com/caronc/apprise)
+  (Discord, Telegram, email, ntfy/Pushover push, SMS, …). Configure one or more
+  service URLs in **Settings → Notifications**, with a **Test** button. New
+  endpoints: `GET/POST /api/notifications`, `POST /api/notifications/test`.
+- **Cookie management from the UI** — paste a `cookies.txt` in **Settings →
+  Cookies YouTube** (no volume remount or container restart). Cookies are stored
+  in the writable `/config` volume and **auto-refreshed**: yt-dlp's rotated jar
+  is written back after each run, so the session stays alive far longer and you
+  rarely have to re-deposit cookies. A legacy `/cookies/cookies.txt` mount is
+  imported automatically. New endpoints: `GET/POST/DELETE /api/cookies`.
+- **"Mon YouTube"** — one-click access, in the Explorer tab, to your signed-in
+  account's own lists: **À regarder plus tard** (Watch Later), **vidéos likées**
+  and **abonnements** (recent uploads). No URL to paste — they resolve through
+  your stored cookies and feed the existing preview / download / follow flow.
+  - **Follow Watch Later / Liked** ("Suivre") — creates a subscription so new
+    items added to the list auto-download (future-only by default; use "Voir" to
+    grab the current contents).
+  - **Pick subscriptions to follow** ("Choisir…") — a dialog lists every channel
+    you're subscribed to on YouTube (with avatars + name filter); tick the ones
+    you want and follow them in one go. Each becomes its own watch,
+    future-uploads-only, so new videos sync without a massive back-catalogue
+    download. Already-followed channels are shown as such. New endpoints:
+    `GET /api/youtube/subscriptions`, `POST /api/youtube/subscriptions/follow`.
+    The unbounded ":ytsubscriptions" preview is now capped (`limit` on
+    `/api/extract`) so it can't paginate forever.
+
+Also in this release — search, an interactive channel browser, 4K, parallel
+subscription downloads, and first-class NAS deployment:
 
 **Discovery & channels**
 - **Search by name** — find creators and videos without knowing a URL; results
@@ -91,5 +142,5 @@ subscriptions. Runs as a single Docker image (plus a PO-token sidecar).
 - The stateless backend does not support pausing/cancelling a running download
   or per-subscription content filters; those controls are informational only.
 
-[0.1.0]: https://github.com/OWNER/REPO/releases/tag/v0.1.0
+[0.0.2]: https://github.com/OWNER/REPO/releases/tag/v0.0.2
 [0.0.1]: https://github.com/OWNER/REPO/releases/tag/v0.0.1

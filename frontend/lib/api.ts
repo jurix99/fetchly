@@ -130,11 +130,13 @@ export async function fetchChannelVideosPage(
   }
 }
 
-/** Récupère les vidéos d'une playlist. */
+/** Récupère les vidéos d'une playlist. `limit` borne l'énumération (utile pour
+ *  les flux non bornés comme les abonnements). */
 export async function fetchPlaylistVideos(
   url: string,
+  limit?: number,
 ): Promise<{ playlist: PlaylistPreview; videos: VideoPreview[] }> {
-  const d = await backend.extract(url)
+  const d = await backend.extract(url, limit)
   if (d.error) throw new Error(d.error)
   const videos = (d.videos ?? []).map(toPreview)
   const playlist: PlaylistPreview = {
