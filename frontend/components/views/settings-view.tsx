@@ -8,6 +8,9 @@ import {
 } from "lucide-react"
 
 import { useStore } from "@/components/store-provider"
+import { CookiesCard } from "@/components/cookies-card"
+import { DiskCard } from "@/components/disk-card"
+import { NotificationsCard } from "@/components/notifications-card"
 import { QualitySelect, FormatSelect } from "@/components/option-selects"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -170,8 +173,23 @@ export function SettingsView() {
               onCheckedChange={(v) => updateSettings({ downloadArchive: v })}
             />
           </Row>
+          <Row
+            title="Métadonnées Jellyfin / Plex"
+            description="Écrire un .nfo + poster à côté de chaque vidéo"
+          >
+            <Switch
+              checked={settings.nfoExport}
+              onCheckedChange={(v) => updateSettings({ nfoExport: v })}
+            />
+          </Row>
         </CardContent>
       </Card>
+
+      <DiskCard />
+
+      <CookiesCard />
+
+      <NotificationsCard />
 
       <p className="flex items-center gap-1.5 text-center text-xs text-muted-foreground">
         <SettingsIcon className="size-3.5" />

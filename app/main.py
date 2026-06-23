@@ -14,7 +14,6 @@ import ctypes
 import ctypes.util
 import os
 import shutil
-import tempfile
 import threading
 import time
 import uuid
@@ -32,17 +31,17 @@ from pydantic import BaseModel
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DateRange
 
-from . import store
+from . import cookies, metadata, notify, store
 
 BASE_DIR = Path(__file__).resolve().parent
 # Mounted as a volume in Docker; override with DOWNLOAD_DIR for custom NAS shares.
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optional Netscape-format cookies.txt, mounted into the container. Required to
-# get past YouTube's "Sign in to confirm you're not a bot" check, which is
-# common from datacenter/Docker IPs. Export it from your logged-in browser.
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "/cookies/cookies.txt")
+# Cookies (Netscape cookies.txt) are managed by the `cookies` module: uploaded
+# from the UI into the writable /config volume, or seeded from a legacy
+# /cookies/cookies.txt mount. Required to reach Watch Later / Liked / private
+# playlists and to clear YouTube's "confirm you're not a bot" check.
 
 # bgutil PO-token provider (sidecar container). YouTube increasingly requires a
 # proof-of-origin token; the bgutil-ytdlp-pot-provider plugin fetches one from
@@ -114,33 +113,62 @@ def _format_opts(quality: str, fmt: str) -> dict[str, Any]:
     """
     fmt = (fmt or "MP4").upper()
     q = _QUALITY_NORM.get(quality, "best")
-    thumb_pp = {"key": "FFmpegThumbnailsConvertor", "format": "jpg"}
+    s = store.get_settings()
+    audio = q == "audio" or fmt in ("MP3", "M4A")
 
-    if q == "audio" or fmt in ("MP3", "M4A"):
+    # Convert the downloaded thumbnail to jpg — feeds the Library tile and gives
+    # EmbedThumbnail a format it can mux everywhere.
+    pps: list[dict[str, Any]] = [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"}]
+    opts: dict[str, Any] = {"writethumbnail": True}
+
+    if audio:
         codec = "mp3" if fmt == "MP3" else "m4a"
-        return {
-            "format": "bestaudio/best",
-            "writethumbnail": True,
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": codec},
-            ],
-        }
-
-    height = _QUALITY_HEIGHT.get(q)
-    if height:
-        selector = (
-            f"bv*[height<=?{height}][vcodec^=avc1]+ba[acodec^=mp4a]/"
-            f"bv*[height<=?{height}]+ba[acodec^=mp4a]/"
-            f"bv*[height<=?{height}]+ba/b[height<=?{height}]/b"
-        )
+        opts["format"] = "bestaudio/best"
+        pps.insert(0, {"key": "FFmpegExtractAudio", "preferredcodec": codec})
     else:
-        selector = "bv*+ba[acodec^=mp4a]/bv*+ba/b"
-    return {
-        "format": selector,
-        "merge_output_format": "mkv" if fmt == "MKV" else "mp4",
-        "writethumbnail": True,
-        "postprocessors": [thumb_pp],
-    }
+        height = _QUALITY_HEIGHT.get(q)
+        if height:
+            selector = (
+                f"bv*[height<=?{height}][vcodec^=avc1]+ba[acodec^=mp4a]/"
+                f"bv*[height<=?{height}]+ba[acodec^=mp4a]/"
+                f"bv*[height<=?{height}]+ba/b[height<=?{height}]/b"
+            )
+        else:
+            selector = "bv*+ba[acodec^=mp4a]/bv*+ba/b"
+        opts["format"] = selector
+        opts["merge_output_format"] = "mkv" if fmt == "MKV" else "mp4"
+        # Subtitles (video only).
+        if s.get("subtitles"):
+            langs = (s.get("subtitle_langs") or "fr,en").strip()
+            opts["writesubtitles"] = True
+            opts["writeautomaticsub"] = True
+            opts["subtitleslangs"] = (
+                ["all"] if langs == "all" else [x.strip() for x in langs.split(",") if x.strip()]
+            )
+            if s.get("embed_subtitles"):
+                pps.append({"key": "FFmpegEmbedSubtitle"})
+
+    # SponsorBlock (works on audio and video).
+    if s.get("sponsorblock"):
+        cats = ["sponsor", "selfpromo", "interaction"]
+        pps.append({"key": "SponsorBlock", "categories": cats, "api": "https://sponsor.ajay.app"})
+        if s.get("sponsorblock_mode") != "mark":
+            pps.append({"key": "ModifyChapters", "remove_sponsor_segments": cats})
+
+    # Metadata + chapters in one pass (SponsorBlock "mark" needs chapters written).
+    add_meta = bool(s.get("embed_metadata"))
+    add_chapters = bool(s.get("embed_chapters")) or (
+        s.get("sponsorblock") and s.get("sponsorblock_mode") == "mark"
+    )
+    if add_meta or add_chapters:
+        pps.append({"key": "FFmpegMetadata", "add_metadata": add_meta, "add_chapters": add_chapters})
+
+    # Embed cover art last; keep the on-disk jpg for the Library.
+    if s.get("embed_thumbnail"):
+        pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
+
+    opts["postprocessors"] = pps
+    return opts
 
 
 def _now_iso() -> str:
@@ -181,6 +209,7 @@ class Job:
     total: int = 0
     completed: int = 0
     downloaded: int = 0  # how many were actually new (not skipped)
+    failed: int = 0  # how many videos errored out
     current_title: str = ""
     current_thumbnail: str = ""  # thumbnail of the video currently downloading
     current_percent: float = 0.0
@@ -216,6 +245,10 @@ class DownloadRequest(BaseModel):
 
 class ExtractRequest(BaseModel):
     url: str
+    # Optional cap on how many entries to enumerate. Needed for unbounded feeds
+    # like ":ytsubscriptions" (every upload from every sub) which would otherwise
+    # paginate almost forever; yt-dlp stops early via lazy playlist_items.
+    limit: int | None = None
 
 
 class SearchRequest(BaseModel):
@@ -234,6 +267,44 @@ class SettingsRequest(BaseModel):
     watch_interval_minutes: int | None = None
     organize: str | None = None
     max_concurrent: int | None = None
+    # Media options (applied to yt-dlp). All optional; only sent keys are saved.
+    subtitles: bool | None = None
+    subtitle_langs: str | None = None
+    embed_subtitles: bool | None = None
+    embed_thumbnail: bool | None = None
+    embed_metadata: bool | None = None
+    embed_chapters: bool | None = None
+    sponsorblock: bool | None = None
+    sponsorblock_mode: str | None = None
+    bandwidth_limit: float | None = None
+    download_archive: bool | None = None
+    min_free_gb: float | None = None
+    nfo_export: bool | None = None
+
+
+class NotificationsRequest(BaseModel):
+    enabled: bool | None = None
+    urls: list[str] | None = None
+    on_video: bool | None = None
+    on_error: bool | None = None
+    on_summary: bool | None = None
+
+
+class CookiesRequest(BaseModel):
+    content: str = ""  # raw Netscape cookies.txt pasted/uploaded from the UI
+
+
+class FollowChannel(BaseModel):
+    url: str
+    title: str = ""
+    avatar: str = ""
+
+
+class FollowSubsRequest(BaseModel):
+    channels: list[FollowChannel] = []
+    # Default OFF: backfilling the whole back-catalogue of the chosen channels
+    # would download an enormous amount — only grab new uploads from now on.
+    backfill: bool = False
 
 
 class WatchRequest(BaseModel):
@@ -279,17 +350,25 @@ def _common_opts(log: list[str]) -> tuple[dict[str, Any], str | None]:
         },
     }
 
-    temp_cookies: str | None = None
-    if os.path.isfile(COOKIES_FILE):
-        fd, temp_cookies = tempfile.mkstemp(suffix=".txt", prefix="cookies-")
-        os.close(fd)
-        shutil.copyfile(COOKIES_FILE, temp_cookies)
+    # Bandwidth cap (per download). Setting stores MB/s; yt-dlp wants bytes/s.
+    try:
+        bw = float(store.get_settings().get("bandwidth_limit") or 0)
+    except (TypeError, ValueError):
+        bw = 0
+    if bw > 0:
+        opts["ratelimit"] = int(bw * 1_000_000)
+
+    # A private, writable copy of the configured cookies (UI-uploaded or the
+    # legacy mount). yt-dlp rewrites the jar on close; callers persist that
+    # refresh via cookies.commit() or drop it via cookies.discard().
+    temp_cookies = cookies.prepare()
+    if temp_cookies:
         opts["cookiefile"] = temp_cookies
         log.append("Using cookies file for authentication.")
     else:
         log.append(
-            "No cookies file found. If YouTube blocks with a bot check, "
-            "mount a cookies.txt (see README)."
+            "No cookies file found. If YouTube blocks with a bot check, add a "
+            "cookies.txt in Settings → Cookies (see README)."
         )
     return opts, temp_cookies
 
@@ -345,8 +424,7 @@ def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int
                     continue
                 new_entries.append(entry)
     finally:
-        if probe_cookie and os.path.exists(probe_cookie):
-            os.remove(probe_cookie)
+        cookies.commit(probe_cookie)
 
     def aggregate() -> None:
         with lock:
@@ -401,15 +479,21 @@ def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int
                     job.downloaded += 1
                 job.log.append(f"Downloaded: {title}")
                 _drop_file_cache(final)
+                metadata.write_sidecar(final, result)
+                notify.notify_video_downloaded(
+                    title, entry.get("uploader") or entry.get("channel") or ""
+                )
                 status = "downloaded"
             else:
                 job.log.append(f"Skipped: {title}")
         except Exception as exc:  # noqa: BLE001
             job.log.append(f"Failed: {title} ({exc})")
+            with lock:
+                job.failed += 1
+            notify.notify_video_failed(title, str(exc))
             status = "failed"
         finally:
-            if w_cookie and os.path.exists(w_cookie):
-                os.remove(w_cookie)
+            cookies.discard(w_cookie)  # parallel worker: don't race the jar back
             with lock:
                 speeds.pop(vid, None)
                 job.completed += 1
@@ -438,7 +522,22 @@ def _download_parallel(job: Job, targets: list[dict[str, Any]], concurrency: int
         job.total = max(job.completed, 1)
 
 
+def _job_summary(job: Job) -> None:
+    """End-of-batch digest notification — only for multi-video jobs (a single
+    video already got its own per-video notification)."""
+    if job.total > 1:
+        notify.notify_job_summary(job.playlist_title or job.url, job.downloaded, job.failed)
+
+
 def _run_job(job: Job) -> None:
+    # Guard the disk for scheduled/watch downloads too (manual ones are also
+    # checked at the API). Refusing here keeps a backfill from filling the volume.
+    if _disk_too_full():
+        job.status = "error"
+        job.error = f"Espace disque insuffisant ({round(_disk_info()['free'] / _GB, 1)} Go libres)."
+        job.log.append(job.error)
+        _check_disk_alert()
+        return
     job.status = "running"
 
     def progress_hook(d: dict[str, Any]) -> None:
@@ -497,8 +596,7 @@ def _run_job(job: Job) -> None:
             with YoutubeDL(list_opts) as lydl:
                 info = lydl.extract_info(job.url, download=False)
         finally:
-            if list_cookies and os.path.exists(list_cookies):
-                os.remove(list_cookies)
+            cookies.commit(list_cookies)
 
         entries = info.get("entries") if info else None
         if entries is not None:
@@ -519,6 +617,7 @@ def _run_job(job: Job) -> None:
             _download_parallel(job, targets, concurrency)
             job.status = "done"
             job.log.append(f"Finished. {job.downloaded} new file(s).")
+            _job_summary(job)
             return
 
         # For a date-limited backfill, count consecutive date-rejected videos so
@@ -560,10 +659,17 @@ def _run_job(job: Job) -> None:
                         final = str(Path(filename).with_suffix("." + ext))
                         job.files.append(Path(final).name)
                         job.downloaded += 1
-                        job.log.append(f"Downloaded: {entry.get('title', '')}")
+                        title = result.get("title") or entry.get("title", "")
+                        job.log.append(f"Downloaded: {title}")
                         _drop_file_cache(final)
+                        metadata.write_sidecar(final, result)
+                        notify.notify_video_downloaded(
+                            title, result.get("uploader") or result.get("channel") or ""
+                        )
                 except Exception as exc:  # noqa: BLE001
                     job.log.append(f"Failed: {entry.get('title', '')} ({exc})")
+                    job.failed += 1
+                    notify.notify_video_failed(entry.get("title", ""), str(exc))
                     if "Requested format" in str(exc):
                         _log_available_formats(ydl, video_url, job)
                 finally:
@@ -571,13 +677,13 @@ def _run_job(job: Job) -> None:
 
         job.status = "done"
         job.log.append(f"Finished. {job.downloaded} new file(s).")
+        _job_summary(job)
     except Exception as exc:  # noqa: BLE001
         job.status = "error"
         job.error = str(exc)
         job.log.append(f"Error: {exc}")
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
         # Return the heap freed by this download/extraction to the OS so idle
         # RSS doesn't stay inflated after a backfill.
         _release_memory()
@@ -634,8 +740,7 @@ def _fetch_channel_avatar(url: str, log: list[str]) -> str:
     except Exception:  # noqa: BLE001
         return ""
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
 
 
 def _channel_avatar(info: dict[str, Any]) -> str:
@@ -710,6 +815,50 @@ def _drop_file_cache(path: str) -> None:
         pass
 
 
+# --- Disk space ------------------------------------------------------------
+_GB = 1024 ** 3
+_disk_low_notified = False  # debounce so the "low disk" alert fires once, not每tick
+
+
+def _disk_info() -> dict[str, float]:
+    """Free/total/used bytes for the downloads volume, plus a percent used."""
+    try:
+        usage = shutil.disk_usage(DOWNLOAD_DIR)
+        pct = (usage.used / usage.total * 100) if usage.total else 0.0
+        return {"free": usage.free, "total": usage.total, "used": usage.used, "percent": round(pct, 1)}
+    except OSError:
+        return {"free": 0, "total": 0, "used": 0, "percent": 0.0}
+
+
+def _min_free_bytes() -> int:
+    try:
+        return int(float(store.get_settings().get("min_free_gb") or 0) * _GB)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _disk_too_full() -> bool:
+    """True when free space is under the configured floor (download should be
+    refused). A floor of 0 disables the guard."""
+    floor = _min_free_bytes()
+    return floor > 0 and _disk_info()["free"] < floor
+
+
+def _check_disk_alert() -> None:
+    """Fire a one-shot notification when free space drops below the floor, and
+    re-arm once it recovers comfortably (1.5×) so we don't spam."""
+    global _disk_low_notified
+    floor = _min_free_bytes()
+    if floor <= 0:
+        return
+    free = _disk_info()["free"]
+    if free < floor and not _disk_low_notified:
+        _disk_low_notified = True
+        notify.notify_disk_low(round(free / _GB, 1), round(floor / _GB, 1))
+    elif free > floor * 1.5:
+        _disk_low_notified = False
+
+
 _MAX_JOBS = 300
 
 
@@ -751,8 +900,7 @@ def _flat_list(url: str, log: list[str]) -> list[dict[str, Any]]:
         log.append(f"List {url}: {exc}")
         return []
     finally:
-        if cookie and os.path.exists(cookie):
-            os.remove(cookie)
+        cookies.commit(cookie)
 
 
 def _watch_sources(url: str) -> list[str]:
@@ -811,9 +959,61 @@ def _collect_new_videos(watch: dict[str, Any], log: list[str]) -> list[dict[str,
                     seen.add(e["id"])
                     out.append(e)
         finally:
-            if cookie and os.path.exists(cookie):
-                os.remove(cookie)
+            cookies.commit(cookie)
     return out
+
+
+def _entry_avatar(e: dict[str, Any]) -> str:
+    """A channel entry's avatar from a flat listing (no video-id fallback, which
+    would wrongly build a thumbnail URL from a channel id)."""
+    thumbs = e.get("thumbnails")
+    if thumbs:
+        return thumbs[-1].get("url", "")
+    return e.get("thumbnail") or ""
+
+
+def _list_subscribed_channels(log: list[str], cap: int = 500) -> list[dict[str, str]]:
+    """Best-effort list of the signed-in user's subscribed channels (needs
+    cookies). Tries the dedicated subscriptions *channels* page; falls back to
+    deriving the distinct channels from the recent uploads feed (bounded, so a
+    sub that hasn't uploaded recently may be missed)."""
+    channels: dict[str, dict[str, str]] = {}
+
+    def add(url: str, name: str, avatar: str = "") -> None:
+        url = (url or "").strip()
+        if url and url not in channels:
+            channels[url] = {"url": url, "name": (name or url).strip(), "avatar": avatar or ""}
+
+    # 1) The subscriptions "channels" page lists every channel directly.
+    for e in _flat_list("https://www.youtube.com/feed/channels", log):
+        add(
+            e.get("url") or e.get("channel_url") or e.get("uploader_url") or "",
+            e.get("title") or e.get("channel") or e.get("uploader") or "",
+            _entry_avatar(e),
+        )
+
+    # 2) Fallback: distinct channels behind the recent uploads feed (bounded).
+    if not channels:
+        opts, cookie = _common_opts(log)
+        opts["extract_flat"] = "in_playlist"
+        opts["playlist_items"] = f"1:{cap}"
+        opts["lazy_playlist"] = True
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(":ytsubscriptions", download=False)
+            for e in [e for e in ((info or {}).get("entries") or []) if e]:
+                cid = e.get("channel_id")
+                add(
+                    e.get("channel_url")
+                    or e.get("uploader_url")
+                    or (f"https://www.youtube.com/channel/{cid}" if cid else ""),
+                    e.get("channel") or e.get("uploader") or "",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"subscriptions feed: {exc}")
+        finally:
+            cookies.commit(cookie)
+    return list(channels.values())
 
 
 def _seed_archive(url: str, log: list[str]) -> list[dict[str, Any]]:
@@ -930,6 +1130,7 @@ def _scheduler_loop() -> None:
     """Wake once a minute and check any watch whose interval has elapsed."""
     while True:
         try:
+            _check_disk_alert()  # warn (once) if the downloads volume is low
             interval = store.get_settings()["watch_interval_minutes"]
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=interval)
             for watch in store.list_watches():
@@ -985,6 +1186,13 @@ def _on_startup() -> None:
 async def start_download(req: DownloadRequest) -> JSONResponse:
     if not req.url.strip():
         return JSONResponse({"error": "URL is required"}, status_code=400)
+    if _disk_too_full():
+        free = round(_disk_info()["free"] / _GB, 1)
+        _check_disk_alert()
+        return JSONResponse(
+            {"error": f"Espace disque insuffisant ({free} Go libres). Libère de la place."},
+            status_code=507,
+        )
     quality = req.quality or store.get_settings()["default_quality"]
     job = Job(
         id=str(uuid.uuid4()),
@@ -992,6 +1200,9 @@ async def start_download(req: DownloadRequest) -> JSONResponse:
         quality=quality,
         fmt=req.format or "MP4",
         dest=req.subfolder.strip(),
+        # Honor the "download archive" setting for manual downloads too — skip
+        # (and record) anything already grabbed.
+        use_archive=bool(store.get_settings().get("download_archive", False)),
     )
     with JOBS_LOCK:
         JOBS[job.id] = job
@@ -1022,6 +1233,28 @@ async def status(job_id: str) -> JSONResponse:
     )
 
 
+_MEDIA_SETTING_KEYS = (
+    "subtitles", "subtitle_langs", "embed_subtitles", "embed_thumbnail",
+    "embed_metadata", "embed_chapters", "sponsorblock", "sponsorblock_mode",
+    "bandwidth_limit", "download_archive", "min_free_gb", "nfo_export",
+)
+
+
+@app.get("/api/disk")
+async def get_disk() -> JSONResponse:
+    info = _disk_info()
+    floor = _min_free_bytes()
+    return JSONResponse(
+        {
+            **info,
+            "free_gb": round(info["free"] / _GB, 1),
+            "total_gb": round(info["total"] / _GB, 1),
+            "min_free_gb": store.get_settings().get("min_free_gb", 0),
+            "low": floor > 0 and info["free"] < floor,
+        }
+    )
+
+
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
     data = store.get_settings()
@@ -1032,18 +1265,65 @@ async def get_settings() -> JSONResponse:
 
 @app.post("/api/settings")
 async def set_settings(req: SettingsRequest) -> JSONResponse:
+    # Only the media keys that were actually sent (non-None) get saved.
+    media = {k: getattr(req, k) for k in _MEDIA_SETTING_KEYS if getattr(req, k) is not None}
     cfg = store.update_settings(
-        req.default_quality, req.watch_interval_minutes, req.organize, req.max_concurrent
+        req.default_quality,
+        req.watch_interval_minutes,
+        req.organize,
+        req.max_concurrent,
+        media=media or None,
     )
     _set_download_concurrency(cfg.get("max_concurrent", 3))
-    return JSONResponse(
-        {
-            "default_quality": cfg["default_quality"],
-            "watch_interval_minutes": cfg["watch_interval_minutes"],
-            "organize": cfg["organize"],
-            "max_concurrent": cfg.get("max_concurrent", 3),
-        }
-    )
+    data = store.get_settings()
+    data["download_dir"] = str(DOWNLOAD_DIR)
+    data["qualities"] = list(QUALITY_FORMATS.keys())
+    return JSONResponse(data)
+
+
+@app.get("/api/notifications")
+async def get_notifications() -> JSONResponse:
+    data = store.get_notifications()
+    data["available"] = notify.available()
+    return JSONResponse(data)
+
+
+@app.post("/api/notifications")
+async def set_notifications(req: NotificationsRequest) -> JSONResponse:
+    events = {
+        "on_video": req.on_video,
+        "on_error": req.on_error,
+        "on_summary": req.on_summary,
+    }
+    cfg = store.update_notifications(req.enabled, req.urls, events=events)
+    return JSONResponse(cfg)
+
+
+@app.post("/api/notifications/test")
+async def test_notifications(req: NotificationsRequest) -> JSONResponse:
+    # Test the URLs from the request if provided (so the user can try before
+    # saving), otherwise fall back to the saved ones.
+    urls = req.urls if req.urls is not None else store.get_notifications()["urls"]
+    ok, message = notify.send_test(urls)
+    return JSONResponse({"ok": ok, "message": message}, status_code=200 if ok else 400)
+
+
+@app.get("/api/cookies")
+async def get_cookies() -> JSONResponse:
+    return JSONResponse(cookies.status())
+
+
+@app.post("/api/cookies")
+async def set_cookies(req: CookiesRequest) -> JSONResponse:
+    ok, message = cookies.save(req.content or "")
+    if not ok:
+        return JSONResponse({"ok": False, "message": message}, status_code=400)
+    return JSONResponse({"ok": True, "message": message, **cookies.status()})
+
+
+@app.delete("/api/cookies")
+async def delete_cookies() -> JSONResponse:
+    return JSONResponse({"removed": cookies.clear(), **cookies.status()})
 
 
 @app.get("/api/watches")
@@ -1074,6 +1354,46 @@ async def add_watch(req: WatchRequest) -> JSONResponse:
     # Kick off an immediate first check in the background.
     threading.Thread(target=_run_watch_check, args=(watch,), daemon=True).start()
     return JSONResponse(watch)
+
+
+@app.get("/api/youtube/subscriptions")
+async def list_subscriptions() -> JSONResponse:
+    """List the signed-in user's subscribed channels so they can pick which ones
+    to follow. Each is flagged `followed` if it's already a watch. Needs
+    cookies; creates nothing."""
+    if not cookies.status()["present"]:
+        return JSONResponse(
+            {"error": "Cookies YouTube requis (Réglages → Cookies)."}, status_code=400
+        )
+    log: list[str] = []
+    channels = _list_subscribed_channels(log)
+    if not channels:
+        return JSONResponse(
+            {"error": "Aucun abonnement trouvé — cookies expirés ?"}, status_code=400
+        )
+    followed = {w.get("url", "").strip() for w in store.list_watches()}
+    return JSONResponse(
+        {"channels": [{**c, "followed": c["url"].strip() in followed} for c in channels]}
+    )
+
+
+@app.post("/api/youtube/subscriptions/follow")
+async def follow_subscriptions(req: FollowSubsRequest) -> JSONResponse:
+    """Follow the chosen channels (one watch per channel, the model the scheduler
+    is built for). Watches are added WITHOUT an immediate per-channel thread —
+    the scheduler picks them up sequentially on its next tick, so following many
+    at once doesn't spawn a thread storm. Backfill defaults off (future uploads
+    only)."""
+    existing = {w.get("url", "").strip() for w in store.list_watches()}
+    added = 0
+    for ch in req.channels:
+        url = (ch.url or "").strip()
+        if not url or url in existing:
+            continue
+        store.add_watch(url, None, req.backfill, "", "", (ch.title or url).strip(), ch.avatar or "")
+        existing.add(url)
+        added += 1
+    return JSONResponse({"added": added})
 
 
 @app.delete("/api/watches/{watch_id}")
@@ -1229,14 +1549,18 @@ async def extract(req: ExtractRequest) -> JSONResponse:
     log: list[str] = []
     opts, temp_cookies = _common_opts(log)
     opts["extract_flat"] = "in_playlist"
+    if req.limit:
+        # Stop enumerating after `limit` entries (newest-first) — keeps unbounded
+        # feeds like ":ytsubscriptions" from paginating forever.
+        opts["playlist_items"] = f"1:{max(1, int(req.limit))}"
+        opts["lazy_playlist"] = True
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url.strip(), download=False)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": str(exc)}, status_code=400)
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
 
     if not info:
         return JSONResponse({"error": "Extraction échouée"}, status_code=400)
@@ -1281,8 +1605,7 @@ async def channel_info(req: ExtractRequest) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": str(exc)}, status_code=400)
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
     return JSONResponse(
         {
             "name": info.get("channel") or info.get("title") or "",
@@ -1318,8 +1641,7 @@ async def channel_videos(req: ChannelVideosRequest) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": str(exc)}, status_code=400)
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
 
     entries = [e for e in ((info or {}).get("entries") or []) if e]
     videos = [_video_dict(e) for e in entries]
@@ -1352,8 +1674,7 @@ async def search(req: SearchRequest) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": str(exc)}, status_code=400)
     finally:
-        if temp_cookies and os.path.exists(temp_cookies):
-            os.remove(temp_cookies)
+        cookies.commit(temp_cookies)
 
     entries = [e for e in ((info or {}).get("entries") or []) if e]
     videos = [_video_dict(e) for e in entries]

@@ -1,5 +1,9 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
+# Apprise: one library, 100+ notification services (Discord, Telegram, email,
+# ntfy, Pushover, Slack, SMS via Twilio/Vonage, …). Used to alert when a video
+# finishes downloading; services are configured as simple URLs in the settings.
+apprise==1.9.2
 # yt-dlp is installed separately in the Dockerfile (latest nightly) because
 # YouTube breaks older versions frequently and fixes land in nightly first.

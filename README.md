@@ -24,8 +24,18 @@ Runs as a single Docker image (plus a small PO-token sidecar). Built on
   fetched twice, even across restarts.
 - **Live progress** — a queue with per-job progress, speed, and a distinct
   **merge/conversion** phase.
+- **Notifications** — get pinged whenever a video finishes downloading, on
+  whatever channel you like (Discord, Telegram, email, push via ntfy/Pushover,
+  SMS, …). Powered by [Apprise](https://github.com/caronc/apprise): paste one or
+  more service URLs in **Settings → Notifications** and hit **Test**.
+- **Mon YouTube** — connect your account (cookies) and grab your own lists in one
+  click: **Watch Later**, **liked videos**, **subscriptions**. Follow Watch Later
+  to auto-download everything you save on YouTube straight to your NAS.
 - **Organize** — choose where files land (by playlist/channel, by uploader, or
   flat) and an optional per-download subfolder.
+- **Jellyfin / Plex ready** — optionally write a `.nfo` + poster next to each
+  video (title, description, channel, date, genres, thumbnail) so downloads show
+  up as proper items in Jellyfin (native NFO) or Plex (NFO agent).
 
 ## Quick start
 
@@ -65,11 +75,16 @@ usual failure points:
 
 1. With a browser logged into YouTube, use a "Get cookies.txt" extension
    (e.g. *cookies.txt LOCALLY*) and export cookies in **Netscape format**.
-2. Save it as `cookies/cookies.txt` next to the compose file.
-3. `docker compose up` — the app auto-detects it (you'll see "Using cookies
-   file" in the log).
+2. Paste it into **Settings → Cookies YouTube** in the web UI and save — no
+   container restart or volume remount needed. (Alternatively, drop it at
+   `cookies/cookies.txt` next to the compose file; it's imported on first run.)
+3. Cookies are stored in `/config` and **auto-refreshed**: yt-dlp's rotated
+   session token is written back after each use, so they stay valid for weeks/
+   months instead of days — you rarely have to re-deposit them.
 
-Tip: use a throwaway/secondary Google account; re-export when cookies expire.
+Cookies also unlock the **Mon YouTube** shortcuts (Watch Later / liked /
+subscriptions). Tip: use a throwaway/secondary Google account; re-paste from the
+UI on the rare occasion the session finally expires.
 
 If a download still fails, the job log prints how many formats YouTube offered.
 "0 formats offered" means one of the four above isn't working — check that the
@@ -90,7 +105,7 @@ docker compose build --no-cache && docker compose up
   the JSON API, the downloaded media at `/media`, and the built frontend at `/`.
   Key endpoints: `/api/extract` (metadata, no download), `/api/download`,
   `/api/jobs`, `/api/watches` (+ `/videos`, `/check`), `/api/settings`,
-  `/api/files`.
+  `/api/notifications` (+ `/test`), `/api/cookies`, `/api/files`.
 - **`frontend/`** — the Next.js 16 + Tailwind v4 + shadcn (Base UI) dashboard.
   `next build` (`output: "export"`) produces a static site that the Docker build
   copies into `app/web/`; the client calls the backend same-origin. No Node
