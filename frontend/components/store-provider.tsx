@@ -207,16 +207,27 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       defaultFormat: local.defaultFormat || "MP4",
       filenameTemplate: local.filenameTemplate || "",
       organizeBySubfolder: bset ? bset.organize !== "flat" : true,
-      subtitles: local.subtitles || { enabled: false, languages: [], embed: false },
-      embedMetadata: !!local.embedMetadata,
-      embedThumbnail: local.embedThumbnail ?? true,
-      embedChapters: !!local.embedChapters,
+      // Media options are now backend-persisted; prefer the saved value (bset),
+      // falling back to any optimistic local edit, then the default.
+      subtitles: {
+        enabled: bset?.subtitles ?? !!local.subtitles?.enabled,
+        languages: (bset?.subtitle_langs ?? local.subtitles?.languages?.join(",") ?? "fr,en")
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean),
+        embed: bset?.embed_subtitles ?? !!local.subtitles?.embed,
+      },
+      embedMetadata: bset?.embed_metadata ?? !!local.embedMetadata,
+      embedThumbnail: bset?.embed_thumbnail ?? local.embedThumbnail ?? true,
+      embedChapters: bset?.embed_chapters ?? !!local.embedChapters,
       maxConcurrent: local.maxConcurrent ?? bset?.max_concurrent ?? 3,
-      bandwidthLimit: local.bandwidthLimit ?? "",
-      sponsorBlock: !!local.sponsorBlock,
-      sponsorBlockMode: local.sponsorBlockMode || "skip",
+      bandwidthLimit:
+        local.bandwidthLimit ?? (bset?.bandwidth_limit ? String(bset.bandwidth_limit) : ""),
+      sponsorBlock: bset?.sponsorblock ?? !!local.sponsorBlock,
+      sponsorBlockMode: bset?.sponsorblock_mode || local.sponsorBlockMode || "skip",
       cookiesImport: !!local.cookiesImport,
-      downloadArchive: local.downloadArchive ?? true,
+      downloadArchive: bset?.download_archive ?? local.downloadArchive ?? true,
+      nfoExport: bset?.nfo_export ?? !!local.nfoExport,
       theme: local.theme || "dark",
       // extra (read by settings-view)
       ...( { checkIntervalHours: local.checkIntervalHours ?? intervalHours } as object),
@@ -352,10 +363,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setLocal((l) => ({ ...l, maxConcurrent: n }))
     backend.saveSettings({ max_concurrent: Math.max(1, n) }).then(setBset).catch(() => {})
   }, [])
-  const setBandwidthLimit = useCallback(
-    (n: number) => setLocal((l) => ({ ...l, bandwidthLimit: n ? String(n) : "" })),
-    [],
-  )
+  const setBandwidthLimit = useCallback((n: number) => {
+    setLocal((l) => ({ ...l, bandwidthLimit: n ? String(n) : "" }))
+    backend.saveSettings({ bandwidth_limit: n > 0 ? n : 0 }).then(setBset).catch(() => {})
+  }, [])
 
   const updateSettings = useCallback((patch: Partial<Settings> & { checkIntervalHours?: number }) => {
     setLocal((l) => ({ ...l, ...patch }))
@@ -364,6 +375,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (patch.organizeBySubfolder !== undefined) b.organize = patch.organizeBySubfolder ? "playlist" : "flat"
     if (patch.checkIntervalHours !== undefined)
       b.watch_interval_minutes = Math.max(1, Math.round(patch.checkIntervalHours * 60))
+    // Media options → backend keys.
+    if (patch.subtitles) {
+      b.subtitles = !!patch.subtitles.enabled
+      b.subtitle_langs = (patch.subtitles.languages || []).join(",") || "fr,en"
+      b.embed_subtitles = !!patch.subtitles.embed
+    }
+    if (patch.embedMetadata !== undefined) b.embed_metadata = patch.embedMetadata
+    if (patch.embedThumbnail !== undefined) b.embed_thumbnail = patch.embedThumbnail
+    if (patch.embedChapters !== undefined) b.embed_chapters = patch.embedChapters
+    if (patch.sponsorBlock !== undefined) b.sponsorblock = patch.sponsorBlock
+    if (patch.sponsorBlockMode !== undefined) b.sponsorblock_mode = patch.sponsorBlockMode
+    if (patch.downloadArchive !== undefined) b.download_archive = patch.downloadArchive
+    if (patch.nfoExport !== undefined) b.nfo_export = patch.nfoExport
     if (Object.keys(b).length) backend.saveSettings(b).then(setBset).catch(() => {})
   }, [])
 

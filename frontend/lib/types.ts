@@ -110,6 +110,7 @@ export interface Settings {
   sponsorBlockMode: "skip" | "mark"
   cookiesImport: boolean
   downloadArchive: boolean
+  nfoExport: boolean
   theme: "light" | "dark" | "system"
 }
 
