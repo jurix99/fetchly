@@ -153,7 +153,12 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
     active: w.enabled,
     lastChecked: w.last_checked || new Date().toISOString(),
     dateAfter: w.date_after || "",
-    filters: { excludeShorts: false, excludeLives: false, includeKeywords: [], excludeKeywords: [] },
+    filters: {
+      excludeShorts: w.exclude_shorts ?? false,
+      excludeLives: w.exclude_lives ?? false,
+      includeKeywords: [],
+      excludeKeywords: [],
+    },
     defaultQuality: qualityToFrontend(w.quality),
     defaultFormat: "MP4",
   }
@@ -426,6 +431,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const b: Record<string, unknown> = {}
       if (patch.defaultQuality) b.quality = qualityToBackend(patch.defaultQuality)
       if (patch.dateAfter !== undefined) b.date_after = patch.dateAfter
+      if (patch.filters?.excludeShorts !== undefined) b.exclude_shorts = patch.filters.excludeShorts
+      if (patch.filters?.excludeLives !== undefined) b.exclude_lives = patch.filters.excludeLives
       const ops: Promise<unknown>[] = []
       if (Object.keys(b).length) ops.push(backend.patchWatch(id, b))
       if (patch.checkIntervalHours !== undefined)
@@ -459,6 +466,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           // Show the name + logo immediately, before the first sync fills them in.
           title: sub.name,
           thumbnail: sub.avatar,
+          exclude_shorts: sub.filters.excludeShorts,
+          exclude_lives: sub.filters.excludeLives,
         })
         .then((res) => {
           if ((res as { error?: string }).error) {

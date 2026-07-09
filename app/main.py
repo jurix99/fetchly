@@ -315,6 +315,8 @@ class WatchRequest(BaseModel):
     date_after: str = ""  # ISO date "YYYY-MM-DD"; only sync newer uploads
     title: str = ""  # known channel name, so the card shows it before first sync
     thumbnail: str = ""  # known channel avatar, shown before first sync
+    exclude_shorts: bool = False  # don't sync the channel's /shorts tab
+    exclude_lives: bool = False  # don't sync live streams / premieres
 
 
 class WatchUpdate(BaseModel):
@@ -322,6 +324,8 @@ class WatchUpdate(BaseModel):
     quality: str | None = None
     subfolder: str | None = None
     date_after: str | None = None  # ISO "YYYY-MM-DD"; "" clears the filter
+    exclude_shorts: bool | None = None
+    exclude_lives: bool | None = None
 
 
 # --- yt-dlp option building ------------------------------------------------
@@ -903,13 +907,29 @@ def _flat_list(url: str, log: list[str]) -> list[dict[str, Any]]:
         cookies.commit(cookie)
 
 
-def _watch_sources(url: str) -> list[str]:
+def _watch_sources(url: str, exclude_shorts: bool = False) -> list[str]:
     """URLs that flat-list a watch's ACTUAL videos. A bare channel URL lists its
-    tabs (Videos/Shorts/…), not videos, so target /videos and /shorts directly."""
+    tabs (Videos/Shorts/…), not videos, so target /videos and /shorts directly.
+    When the watch excludes Shorts we simply don't enumerate the /shorts tab."""
     if _is_channel_url(url):
         root = _channel_root(url).rstrip("/")
-        return [f"{root}/videos", f"{root}/shorts"]
+        srcs = [f"{root}/videos"]
+        if not exclude_shorts:
+            srcs.append(f"{root}/shorts")
+        return srcs
     return [url]
+
+
+# yt-dlp live_status values that mean the entry is (or was) a live stream /
+# premiere rather than a regular upload. Present on YouTube flat listings.
+_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "post_live", "was_live"})
+
+
+def _is_live_entry(e: dict[str, Any]) -> bool:
+    """Whether a flat-listing entry is a live stream / premiere (or its VOD).
+    Best-effort: if yt-dlp didn't populate live_status we treat it as a regular
+    video so we never drop normal uploads."""
+    return str(e.get("live_status") or "").lower() in _LIVE_STATUSES
 
 
 def _collect_new_videos(watch: dict[str, Any], log: list[str]) -> list[dict[str, Any]]:
@@ -917,14 +937,19 @@ def _collect_new_videos(watch: dict[str, Any], log: list[str]) -> list[dict[str,
     filtered by the watch's date — newest-first with an early stop once we pass
     the cutoff so we don't scan the whole back-catalogue."""
     after = (watch.get("date_after") or "").replace("-", "")
+    exclude_shorts = bool(watch.get("exclude_shorts"))
+    exclude_lives = bool(watch.get("exclude_lives"))
     archived = _archive_ids()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for src in _watch_sources(watch["url"]):
+    for src in _watch_sources(watch["url"], exclude_shorts):
         candidates = [
             e
             for e in _flat_list(src, log)
-            if e.get("id") and e["id"] not in archived and e["id"] not in seen
+            if e.get("id")
+            and e["id"] not in archived
+            and e["id"] not in seen
+            and not (exclude_lives and _is_live_entry(e))
         ]
         if not after:
             for e in candidates:
@@ -1016,12 +1041,18 @@ def _list_subscribed_channels(log: list[str], cap: int = 500) -> list[dict[str, 
     return list(channels.values())
 
 
-def _seed_archive(url: str, log: list[str]) -> list[dict[str, Any]]:
+def _seed_archive(watch: dict[str, Any], log: list[str]) -> list[dict[str, Any]]:
     """Record a watch's existing videos into the download archive WITHOUT
-    downloading them, so a 'no backfill' watch only grabs uploads from now on."""
+    downloading them, so a 'no backfill' watch only grabs uploads from now on.
+    Honours the watch's Shorts/Lives filters so excluded content is neither
+    seeded nor later downloaded."""
+    exclude_shorts = bool(watch.get("exclude_shorts"))
+    exclude_lives = bool(watch.get("exclude_lives"))
     entries: list[dict[str, Any]] = []
-    for src in _watch_sources(url):
-        entries.extend(_flat_list(src, log))
+    for src in _watch_sources(watch["url"], exclude_shorts):
+        entries.extend(
+            e for e in _flat_list(src, log) if not (exclude_lives and _is_live_entry(e))
+        )
     with store.ARCHIVE_FILE.open("a", encoding="utf-8") as f:
         for entry in entries:
             if entry.get("id"):
@@ -1054,7 +1085,7 @@ def _do_watch_check(watch: dict[str, Any]) -> None:
     # First run with backfill disabled: just mark existing videos as seen.
     if not watch.get("backfill", True) and not watch.get("seeded"):
         try:
-            entries = _seed_archive(watch["url"], log)
+            entries = _seed_archive(watch, log)
             videos = [
                 {"id": e.get("id"), "title": e.get("title") or e.get("id") or "", "synced": True}
                 for e in entries
@@ -1350,6 +1381,8 @@ async def add_watch(req: WatchRequest) -> JSONResponse:
         req.date_after.strip(),
         req.title.strip(),
         req.thumbnail.strip(),
+        req.exclude_shorts,
+        req.exclude_lives,
     )
     # Kick off an immediate first check in the background.
     threading.Thread(target=_run_watch_check, args=(watch,), daemon=True).start()
@@ -1437,6 +1470,10 @@ async def update_watch(watch_id: str, req: WatchUpdate) -> JSONResponse:
         fields["subfolder"] = req.subfolder.strip()
     if req.date_after is not None:
         fields["date_after"] = req.date_after.strip()
+    if req.exclude_shorts is not None:
+        fields["exclude_shorts"] = req.exclude_shorts
+    if req.exclude_lives is not None:
+        fields["exclude_lives"] = req.exclude_lives
     watch = store.update_watch(watch_id, **fields)
     if watch is None:
         return JSONResponse({"error": "Unknown watch"}, status_code=404)

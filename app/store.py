@@ -180,6 +180,8 @@ def add_watch(
     date_after: str = "",
     title: str = "",
     thumbnail: str = "",
+    exclude_shorts: bool = False,
+    exclude_lives: bool = False,
 ) -> dict[str, Any]:
     with _LOCK:
         cfg = _read()
@@ -189,6 +191,8 @@ def add_watch(
             "quality": quality,  # None -> resolve to default at check time
             "subfolder": subfolder,  # optional destination folder under /downloads
             "date_after": date_after,  # ISO date; only sync newer uploads
+            "exclude_shorts": bool(exclude_shorts),  # skip the /shorts tab
+            "exclude_lives": bool(exclude_lives),  # skip live streams / premieres
             "title": title,  # known channel name (refreshed on first sync)
             "thumbnail": thumbnail,  # known channel avatar (refreshed on sync)
             "enabled": True,

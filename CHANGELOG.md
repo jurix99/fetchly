@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Subscription "Exclure les Shorts / Lives" now actually apply** — these
+  filters were stored only in the frontend and never reached the backend, so
+  Shorts (and live streams) kept downloading regardless of the toggle. The
+  flags are now persisted per watch and honoured when enumerating a channel:
+  excluding Shorts skips the `/shorts` tab entirely, and excluding Lives drops
+  live/upcoming/premiere entries (by `live_status`). Applied at both seed and
+  sync time.
+
 ## [0.0.2] - 2026-06-22
 
 ### Added

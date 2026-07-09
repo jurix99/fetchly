@@ -29,6 +29,8 @@ export interface BackendWatch {
   quality: string | null
   subfolder?: string
   date_after?: string
+  exclude_shorts?: boolean
+  exclude_lives?: boolean
   title: string
   thumbnail?: string | null
   enabled: boolean
@@ -191,10 +193,19 @@ export const backend = {
     date_after: string
     title?: string
     thumbnail?: string
+    exclude_shorts?: boolean
+    exclude_lives?: boolean
   }) => call<BackendWatch & { error?: string }>("POST", "/api/watches", b),
   patchWatch: (
     id: string,
-    b: Partial<{ enabled: boolean; quality: string; subfolder: string; date_after: string }>,
+    b: Partial<{
+      enabled: boolean
+      quality: string
+      subfolder: string
+      date_after: string
+      exclude_shorts: boolean
+      exclude_lives: boolean
+    }>,
   ) => call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
   removeWatch: (id: string) => call<{ removed: boolean }>("DELETE", `/api/watches/${id}`),
   checkWatch: (id: string) => call<{ status: string }>("POST", `/api/watches/${id}/check`),
