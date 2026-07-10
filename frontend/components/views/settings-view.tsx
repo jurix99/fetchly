@@ -18,6 +18,8 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Slider } from "@/components/ui/slider"
 import { Separator } from "@/components/ui/separator"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { PluginsPanel } from "@/components/plugins-panel"
 
 function Row({
   title,
@@ -51,6 +53,13 @@ export function SettingsView() {
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 p-4 sm:p-6 lg:p-8">
+      <Tabs defaultValue="general" className="gap-5">
+        <TabsList>
+          <TabsTrigger value="general">Réglages</TabsTrigger>
+          <TabsTrigger value="plugins">Plugins</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="general" className="flex flex-col gap-5">
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -195,6 +204,12 @@ export function SettingsView() {
         <SettingsIcon className="size-3.5" />
         Les réglages pris en charge par le backend sont enregistrés automatiquement.
       </p>
+        </TabsContent>
+
+        <TabsContent value="plugins">
+          <PluginsPanel />
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

@@ -5,9 +5,18 @@ export type DownloadStatus =
   | "completed"
   | "failed"
   | "paused"
+  | "canceled"
 
 export type Quality = "Auto" | "1080p" | "720p" | "480p" | "Audio seul"
 export type Format = "MP4" | "MKV" | "MP3" | "M4A"
+
+/** One plugin's outcome in the post-download pipeline (shown on the card). */
+export interface PipelineReport {
+  plugin?: string
+  label: string
+  ok: boolean
+  detail?: string
+}
 
 export interface DownloadItem {
   id: string
@@ -27,6 +36,7 @@ export interface DownloadItem {
   error?: string
   createdAt: string
   filePath?: string
+  reports?: PipelineReport[]
 }
 
 export interface VideoPreview {
@@ -69,13 +79,23 @@ export interface PlaylistPreview {
 }
 
 export interface SubscriptionFilters {
-  minDuration?: number
-  maxDuration?: number
+  minDuration?: number // MINUTES (UI unit; converted to seconds at the API)
+  maxDuration?: number // MINUTES
   excludeShorts: boolean
   excludeLives: boolean
+  // Keyword semantics: include = OU (au moins un présent) ; exclude = OU (un
+  // seul suffit à rejeter) ; exclude gagne sur include.
   includeKeywords: string[]
   excludeKeywords: string[]
   keepLastN?: number
+}
+
+/** Effect of the filters at the last subscription check (from the backend). */
+export interface SubscriptionLastCheck {
+  listed: number
+  matched: number
+  rejectedByFilters: number
+  downloaded: number
 }
 
 export interface Subscription {
@@ -89,6 +109,7 @@ export interface Subscription {
   lastChecked: string
   dateAfter?: string // ISO "YYYY-MM-DD"; only sync uploads on/after this date
   filters: SubscriptionFilters
+  lastCheck?: SubscriptionLastCheck | null
   defaultQuality: string
   defaultFormat: string
 }

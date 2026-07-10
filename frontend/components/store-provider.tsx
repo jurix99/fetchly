@@ -14,6 +14,8 @@ import { toast } from "sonner"
 import { startDownload as apiStartDownload, detectSource, type StartDownloadOptions } from "@/lib/api"
 import {
   backend,
+  filtersToBackend,
+  filtersToFrontend,
   qualityToBackend,
   qualityToFrontend,
   type BackendJob,
@@ -40,6 +42,9 @@ interface StoreValue {
   maxConcurrent: number
   bandwidthLimit: number
   globalPaused: boolean
+  pausedCount: number
+  restoredCount: number
+  dismissRestored: () => void
   activeCount: number
   totalSpeed: string
   addDownload: (options: StartDownloadOptions) => Promise<void>
@@ -75,8 +80,10 @@ const StoreContext = createContext<StoreValue | null>(null)
 const STATUS_MAP: Record<BackendJob["status"], DownloadStatus> = {
   queued: "queued",
   running: "downloading",
+  paused: "paused",
   done: "completed",
   error: "failed",
+  canceled: "canceled",
 }
 
 /** Extract a YouTube video id from a watch/share URL, if present. */
@@ -136,9 +143,10 @@ function jobToDownload(j: BackendJob): DownloadItem {
     progress: j.status === "done" ? 100 : Math.round(j.current_percent || 0),
     speed: j.current_speed || undefined,
     sizeTotal: j.total > 1 ? `${j.completed}/${j.total} vidéos` : undefined,
-    error: j.status === "error" ? "Échec du téléchargement" : undefined,
+    error: j.error || (j.status === "error" ? "Échec du téléchargement" : undefined),
     createdAt: new Date((j.created_at || 0) * 1000).toISOString(),
     filePath: j.files?.[0],
+    reports: j.reports || [],
   }
 }
 
@@ -153,7 +161,24 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
     active: w.enabled,
     lastChecked: w.last_checked || new Date().toISOString(),
     dateAfter: w.date_after || "",
-    filters: { excludeShorts: false, excludeLives: false, includeKeywords: [], excludeKeywords: [] },
+    // Prefer the canonical filters object; fall back to the legacy toggles so a
+    // watch created before filters existed still renders correctly.
+    filters: w.filters
+      ? filtersToFrontend(w.filters)
+      : {
+          excludeShorts: w.exclude_shorts ?? false,
+          excludeLives: w.exclude_lives ?? false,
+          includeKeywords: [],
+          excludeKeywords: [],
+        },
+    lastCheck: w.last_check
+      ? {
+          listed: w.last_check.listed,
+          matched: w.last_check.matched,
+          rejectedByFilters: w.last_check.rejected_by_filters,
+          downloaded: w.last_check.downloaded,
+        }
+      : null,
     defaultQuality: qualityToFrontend(w.quality),
     defaultFormat: "MP4",
   }
@@ -164,7 +189,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [watches, setWatches] = useState<BackendWatch[]>([])
   const [bset, setBset] = useState<BackendSettings | null>(null)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
-  const [globalPaused, setGlobalPaused] = useState(false)
+  // Optimistic status overrides: a control click reflects instantly, then clears
+  // once the server confirms the new status (or the job reaches a terminal one).
+  const [overrides, setOverrides] = useState<Record<string, DownloadStatus>>({})
+  // How many jobs the server resumed after a restart (restoration banner).
+  const [restoredCount, setRestoredCount] = useState(0)
   // Local-only settings the backend doesn't persist.
   const [local, setLocal] = useState<Partial<Settings> & { checkIntervalHours?: number }>({
     defaultFormat: "MP4",
@@ -188,6 +217,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     backend.settings().then(setBset).catch(() => {})
+    // How many jobs were resumed by the last server restart — fetched once so
+    // the banner shows on load and doesn't reappear after the user dismisses it.
+    backend.jobsRestored().then((r) => setRestoredCount(r.count || 0)).catch(() => {})
     refreshJobs()
     refreshWatches()
     const t1 = setInterval(refreshJobs, 1500)
@@ -197,6 +229,30 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       clearInterval(t2)
     }
   }, [refreshJobs, refreshWatches])
+
+  // Drop an optimistic override once the server's real status matches it (or the
+  // job settled into a terminal state), so stale overrides never stick.
+  useEffect(() => {
+    setOverrides((prev) => {
+      if (Object.keys(prev).length === 0) return prev
+      const byId = new Map(jobs.map((j) => [j.id, j]))
+      let changed = false
+      const next: Record<string, DownloadStatus> = {}
+      for (const [id, want] of Object.entries(prev)) {
+        const j = byId.get(id)
+        const real = j ? STATUS_MAP[j.status] : undefined
+        const settled = real && ["completed", "failed", "canceled"].includes(real)
+        if (!j || real === want || settled) {
+          changed = true // resolved — drop the override
+        } else {
+          next[id] = want
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [jobs])
+
+  const dismissRestored = useCallback(() => setRestoredCount(0), [])
 
   const intervalHours = Math.max(1, Math.round((bset?.watch_interval_minutes ?? 60) / 60))
 
@@ -239,12 +295,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // Manual downloads always show. Subscription syncs show only while they're
     // actually downloading a video (current_title set) — so the live download
     // is visible, but a bare "checking" job doesn't clutter the list with the
-    // channel itself.
+    // channel itself. An optimistic override wins over the server status until
+    // the next poll confirms it.
     () =>
       jobs
         .filter((j) => !hidden.has(j.id) && (j.kind !== "watch" || !!j.current_title))
-        .map(jobToDownload),
-    [jobs, hidden],
+        .map((j) => {
+          const item = jobToDownload(j)
+          return overrides[j.id] ? { ...item, status: overrides[j.id] } : item
+        }),
+    [jobs, hidden, overrides],
+  )
+
+  // Live count of paused downloads (drives the "N suspendus" global control).
+  const pausedCount = useMemo(
+    () => downloads.filter((d) => d.status === "paused").length,
+    [downloads],
   )
   const subscriptions = useMemo(
     () => watches.map((w) => watchToSub(w, intervalHours)),
@@ -326,32 +392,86 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [refreshJobs],
   )
 
-  const notSupported = useCallback(
-    () => toast.info("Contrôle en direct non disponible avec ce backend"),
-    [],
-  )
-  const pauseDownload = notSupported
-  const resumeDownload = notSupported
-  const cancelDownload = useCallback((id: string) => {
-    setHidden((h) => new Set(h).add(id))
-    toast.info("Retiré de la liste (le téléchargement en cours n'est pas interrompu)")
+  const clearOverride = useCallback((id: string) => {
+    setOverrides((o) => {
+      if (!(id in o)) return o
+      const next = { ...o }
+      delete next[id]
+      return next
+    })
   }, [])
+
+  // Optimistic control: reflect the target status at once, call the API, then
+  // refresh. On failure (incl. 409 invalid transition) roll back + toast.
+  const control = useCallback(
+    (
+      id: string,
+      optimistic: DownloadStatus,
+      action: () => Promise<{ error?: string }>,
+      failMsg: string,
+    ) => {
+      setOverrides((o) => ({ ...o, [id]: optimistic }))
+      action()
+        .then((res) => {
+          if (res.error) {
+            toast.error(res.error)
+            clearOverride(id)
+          }
+          refreshJobs()
+        })
+        .catch(() => {
+          toast.error(failMsg)
+          clearOverride(id)
+        })
+    },
+    [clearOverride, refreshJobs],
+  )
+
+  const pauseDownload = useCallback(
+    (id: string) => control(id, "paused", () => backend.pauseJob(id), "Échec de la mise en pause"),
+    [control],
+  )
+  const resumeDownload = useCallback(
+    (id: string) => control(id, "downloading", () => backend.resumeJob(id), "Échec de la reprise"),
+    [control],
+  )
+  const cancelDownload = useCallback(
+    (id: string) => control(id, "canceled", () => backend.cancelJob(id), "Échec de l'annulation"),
+    [control],
+  )
+  const retryDownload = useCallback(
+    (id: string) => control(id, "queued", () => backend.retryJob(id), "Échec de la relance"),
+    [control],
+  )
+
   const removeDownload = useCallback((id: string) => {
     setHidden((h) => new Set(h).add(id))
   }, [])
   const reorderDownloads = useCallback(() => {}, [])
-  const pauseAll = notSupported
-  const resumeAll = notSupported
 
-  const retryDownload = useCallback(
-    (id: string) => {
-      const j = jobs.find((x) => x.id === id)
-      if (!j) return
-      backend.download({ url: j.url, quality: j.quality, format: "MP4" }).then(() => refreshJobs())
-      toast.info("Téléchargement relancé")
-    },
-    [jobs, refreshJobs],
-  )
+  const pauseAll = useCallback(() => {
+    backend
+      .pauseAll()
+      .then((r) => {
+        refreshJobs()
+        toast.info(
+          r.paused ? `${r.paused} téléchargement(s) suspendu(s)` : "Aucun téléchargement à suspendre",
+        )
+      })
+      .catch(() => toast.error("Échec de la suspension globale"))
+  }, [refreshJobs])
+
+  const resumeAll = useCallback(() => {
+    backend
+      .resumeAll()
+      .then((r) => {
+        refreshJobs()
+        toast.success(
+          r.resumed ? `${r.resumed} téléchargement(s) repris` : "Aucun téléchargement en pause",
+        )
+      })
+      .catch(() => toast.error("Échec de la reprise globale"))
+  }, [refreshJobs])
 
   const clearCompleted = useCallback(() => {
     const done = jobs.filter((j) => j.status === "done").map((j) => j.id)
@@ -426,6 +546,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const b: Record<string, unknown> = {}
       if (patch.defaultQuality) b.quality = qualityToBackend(patch.defaultQuality)
       if (patch.dateAfter !== undefined) b.date_after = patch.dateAfter
+      // Send the whole canonical filters object (the editor holds the full set).
+      if (patch.filters) b.filters = filtersToBackend(patch.filters)
       const ops: Promise<unknown>[] = []
       if (Object.keys(b).length) ops.push(backend.patchWatch(id, b))
       if (patch.checkIntervalHours !== undefined)
@@ -459,6 +581,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           // Show the name + logo immediately, before the first sync fills them in.
           title: sub.name,
           thumbnail: sub.avatar,
+          // Filters apply to the initial backfill too.
+          exclude_shorts: sub.filters.excludeShorts,
+          exclude_lives: sub.filters.excludeLives,
+          filters: filtersToBackend(sub.filters),
         })
         .then((res) => {
           if ((res as { error?: string }).error) {
@@ -479,7 +605,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     settings,
     maxConcurrent: settings.maxConcurrent,
     bandwidthLimit: Number(settings.bandwidthLimit) || 0,
-    globalPaused,
+    globalPaused: pausedCount > 0,
+    pausedCount,
+    restoredCount,
+    dismissRestored,
     activeCount,
     totalSpeed,
     addDownload,
@@ -490,14 +619,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     removeDownload,
     reorderDownloads,
     clearCompleted,
-    pauseAll: () => {
-      setGlobalPaused(true)
-      pauseAll()
-    },
-    resumeAll: () => {
-      setGlobalPaused(false)
-      resumeAll()
-    },
+    pauseAll,
+    resumeAll,
     setMaxConcurrent,
     setBandwidthLimit,
     updateSettings,

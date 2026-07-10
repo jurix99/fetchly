@@ -5,7 +5,76 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.0.3] - 2026-07-10
+
+### Added
+
+- **Controllable download queue** — running/queued downloads can now be
+  **paused, resumed, cancelled and retried**, individually or all at once, with
+  optimistic UI feedback. Cancelling is confirmed and removes the incomplete
+  `.part` files (completed files are kept); pausing keeps them, so resuming
+  continues where it left off without re-fetching finished videos. Two new
+  statuses, **paused** and **canceled**. New endpoints:
+  `POST /api/jobs/{id}/pause|resume|cancel|retry`,
+  `POST /api/jobs/pause-all|resume-all`.
+- **Persistent queue** — jobs are stored in SQLite (`/config/fetchly.db`, WAL)
+  as the source of truth behind an in-memory cache. A restart no longer loses
+  the queue: interrupted downloads are re-queued automatically (resuming from
+  their `.part` files + a per-job done list, so nothing downloads twice), and
+  the UI shows a *"N téléchargements repris après redémarrage"* banner.
+- **Subscription content filters, applied for real** — min/max **duration**,
+  **include / exclude keywords** (case- and accent-insensitive; a single
+  exclude match wins over include), **exclude Shorts** (by `/shorts/` URL or
+  ≤ 60 s) and **exclude Lives**, plus **keep last N** retention (prunes the
+  oldest files in the watch folder after a sync — never other folders, never
+  the archive). Filters are enforced twice: at listing and as a yt-dlp
+  `match_filter` safety net at download, and apply to the initial backfill too.
+  The editor gets a chip-based keyword input and a **"Tester les filtres"**
+  preview (`POST /api/watches/preview-filters`) reporting kept/rejected on the
+  last ~30 videos; each subscription card shows the last check as
+  *"12 listées · 4 filtrées · 8 téléchargées"*.
+- **Plugin architecture** — a small documented plugin system (`app/plugins/`,
+  see [`docs/PLUGINS.md`](docs/PLUGINS.md)) with three contracts —
+  **SourcePlugin**, **ProcessorPlugin**, **OutputPlugin** — and a journalled
+  post-download pipeline (`content_downloaded → processors → content_ready →
+  outputs`, logged to a `pipeline_runs` table). Builtin and user plugins
+  (dropped in `/config/plugins`) are discovered with **isolated error
+  handling**: a broken plugin is flagged in the UI and never blocks startup.
+  Managed from a new **Réglages → Plugins** tab (enable/disable, settings
+  generated from each plugin's schema). Endpoints: `GET /api/plugins`,
+  `POST /api/plugins/{id}/enable|disable`, `PATCH /api/plugins/{id}/settings`,
+  `POST /api/plugins/{id}/actions/{action}`. yt-dlp is now the first **source**
+  plugin.
+- **Media Center integration (Jellyfin / Plex)** — a builtin **output** plugin
+  that, after each download, writes Kodi/Jellyfin metadata (`episodedetails`
+  `.nfo` per video + per-channel `tvshow.nfo`, `poster.jpg` and `-thumb.jpg`)
+  so each channel shows up as a clean series, and notifies the server to
+  rescan (Jellyfin `POST /Library/Refresh`, Plex
+  `/library/sections/{id|all}/refresh`), **debounced 60 s** so a burst of
+  downloads triggers a single refresh. Includes a **"Tester la connexion"**
+  button (clear DNS / 401 / timeout messages) and a **"Générer les métadonnées
+  pour la bibliothèque existante"** action (background job; never moves or
+  deletes media). Best-effort throughout — a media-center problem never fails
+  or blocks a download; the download card shows what ran
+  (*"NFO ✓ · Jellyfin notifié ✓"*, or a failure linking to the job log).
+- **Design system** — [`frontend/DESIGN.md`](frontend/DESIGN.md) documents the
+  product language: a single source of truth for the status vocabulary
+  (`frontend/lib/status.ts`) and reusable `ConfirmDialog` / `InlineFeedback`
+  (loading / empty / error) components applied across the views.
+
+### Changed
+
+- **Backend restructured** from a single ~1700-line `main.py` into focused
+  modules — download **jobs engine**, **watches** scheduler, plugin
+  **registry** + **pipeline**, the **yt-dlp source plugin** (the only module
+  that imports `yt_dlp`) and thin **routes** — with `main.py` reduced to app
+  assembly + startup. Same public endpoints and download/watch behaviour.
+
+### Fixed
+
+- Subscription filters that were stored only in the frontend now actually reach
+  and are honoured by the backend (see *Subscription content filters* above),
+  superseding the earlier Shorts/Lives-only fix.
 
 ## [0.0.2] - 2026-06-22
 
