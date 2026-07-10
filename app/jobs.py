@@ -278,15 +278,24 @@ def run_job(job: Job) -> None:
 
     _finalize_run(job)
 
-    # Post-download pipeline: processors then outputs. Never fails the download.
-    if job.status == "done" and result is not None and pipeline.has_consumers():
+    if job.status == "done" and result is not None:
+        # Index into the library (source of truth for the Bibliothèque view).
+        # Always runs, independent of plugins; never fails the download.
         try:
-            result = pipeline.run(job.id, result)
-            job.reports = list(result.reports)
-            if job.reports:
-                _persist(job)
+            from . import library
+            library.index_download(job, result)
         except Exception as exc:  # noqa: BLE001
-            job.log.append(f"pipeline: {exc}")
+            job.log.append(f"library: {exc}")
+
+        # Post-download pipeline: processors then outputs. Never fails the DL.
+        if pipeline.has_consumers():
+            try:
+                result = pipeline.run(job.id, result)
+                job.reports = list(result.reports)
+                if job.reports:
+                    _persist(job)
+            except Exception as exc:  # noqa: BLE001
+                job.log.append(f"pipeline: {exc}")
 
 
 def _prune_jobs() -> None:

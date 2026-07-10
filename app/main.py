@@ -20,13 +20,14 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import db, jobs, store, watches
+from . import db, jobs, library, store, watches
 from .plugins.registry import registry
 from .runtime import DOWNLOAD_DIR, WEB_DIR
 from .routes import (
     content,
     downloads,
     files,
+    library as library_routes,
     plugins,
     settings,
     system,
@@ -39,7 +40,9 @@ app = FastAPI(title="Fetchly — Video Downloader", version="0.2.0")
 app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
 
 # API routers (registered before the SPA catch-all mount below).
-for module in (downloads, watches_routes, content, settings, files, system, plugins):
+for module in (
+    downloads, watches_routes, content, settings, files, system, plugins, library_routes,
+):
     app.include_router(module.router)
 
 
@@ -56,6 +59,9 @@ def _on_startup() -> None:
     jobs._prune_jobs()
     jobs.set_concurrency(store.get_settings().get("max_concurrent", 3))
     watches.start_scheduler()
+    # One-time backfill of the library from the existing downloads (guarded by a
+    # DB flag; runs in the background so startup isn't blocked).
+    library.migrate_existing()
 
 
 # Mounted LAST so the API routes take precedence; serves the built SPA.

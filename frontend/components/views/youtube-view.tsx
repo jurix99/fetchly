@@ -35,7 +35,6 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Skeleton } from "@/components/ui/skeleton"
 import { InlineFeedback } from "@/components/inline-feedback"
 import { QualitySelect, FormatSelect } from "@/components/option-selects"
@@ -43,7 +42,6 @@ import { VideoPreviewCard } from "@/components/video-preview-card"
 import { Separator } from "@/components/ui/separator"
 import { ChannelVideoList } from "@/components/channel-video-list"
 import { ChannelDialog } from "@/components/channel-dialog"
-import { SubscriptionsPanel } from "@/components/subscriptions-panel"
 import { SubscriptionsPicker } from "@/components/subscriptions-picker"
 
 type Result =
@@ -154,13 +152,7 @@ export function YoutubeView() {
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 p-4 sm:p-6 lg:p-8">
-      <Tabs defaultValue="explore" className="gap-6">
-        <TabsList>
-          <TabsTrigger value="explore">Explorer</TabsTrigger>
-          <TabsTrigger value="subscriptions">Abonnements</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="explore" className="flex flex-col gap-6">
+      <div className="flex flex-col gap-6">
           <MyYoutube onPick={run} disabled={loading} />
 
           <Card>
@@ -304,12 +296,7 @@ export function YoutubeView() {
               description="Tapez le nom d'un youtubeur ou d'une vidéo, ou collez une URL pour commencer."
             />
           )}
-        </TabsContent>
-
-        <TabsContent value="subscriptions">
-          <SubscriptionsPanel />
-        </TabsContent>
-      </Tabs>
+      </div>
 
       <ChannelDialog
         key={channelDialog?.url ?? "none"}

@@ -1,10 +1,12 @@
 "use client"
 
 import {
+  CompassIcon,
   DownloadIcon,
   HomeIcon,
+  LibraryIcon,
+  RssIcon,
   SettingsIcon,
-  PlayIcon,
   ZapIcon,
 } from "lucide-react"
 
@@ -15,7 +17,9 @@ import type { View } from "@/components/app-shell"
 
 const NAV: { id: View; label: string; icon: typeof HomeIcon }[] = [
   { id: "home", label: "Accueil", icon: HomeIcon },
-  { id: "youtube", label: "YouTube", icon: PlayIcon },
+  { id: "library", label: "Bibliothèque", icon: LibraryIcon },
+  { id: "explorer", label: "Explorer", icon: CompassIcon },
+  { id: "subscriptions", label: "Abonnements", icon: RssIcon },
   { id: "downloads", label: "Téléchargements", icon: DownloadIcon },
   { id: "settings", label: "Réglages", icon: SettingsIcon },
 ]

@@ -2,12 +2,14 @@
 
 import {
   ActivityIcon,
+  CompassIcon,
   DownloadIcon,
   GaugeIcon,
   HomeIcon,
+  LibraryIcon,
   MenuIcon,
+  RssIcon,
   SettingsIcon,
-  PlayIcon,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -25,14 +27,18 @@ import type { View } from "@/components/app-shell"
 
 const TITLES: Record<View, string> = {
   home: "Accueil",
-  youtube: "YouTube",
+  library: "Bibliothèque",
+  explorer: "Explorer",
+  subscriptions: "Abonnements",
   downloads: "Téléchargements",
   settings: "Réglages",
 }
 
 const MOBILE_NAV: { id: View; label: string; icon: typeof HomeIcon }[] = [
   { id: "home", label: "Accueil", icon: HomeIcon },
-  { id: "youtube", label: "YouTube", icon: PlayIcon },
+  { id: "library", label: "Bibliothèque", icon: LibraryIcon },
+  { id: "explorer", label: "Explorer", icon: CompassIcon },
+  { id: "subscriptions", label: "Abonnements", icon: RssIcon },
   { id: "downloads", label: "Téléchargements", icon: DownloadIcon },
   { id: "settings", label: "Réglages", icon: SettingsIcon },
 ]

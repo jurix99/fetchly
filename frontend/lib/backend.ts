@@ -177,6 +177,51 @@ export interface PluginInfo {
   settings: Record<string, unknown>
 }
 
+export type TranscriptStatus = "none" | "queued" | "running" | "done" | "error" | "skipped"
+
+export interface Content {
+  id: string
+  source: string
+  source_id: string
+  url: string
+  title: string
+  description: string
+  channel: string
+  channel_url: string
+  duration_seconds: number | null
+  uploaded_at: string
+  downloaded_at: number | null
+  filepath: string
+  filesize: number | null
+  thumbnail_path: string | null
+  watch_id: string | null
+  kind: "video" | "audio"
+  transcript_status: TranscriptStatus
+  index_status: "none" | "done" | "stale"
+  // added by the API serializer
+  thumbnail_url: string | null
+  stream_url: string
+  file_exists: boolean
+}
+
+export interface LibraryPage {
+  items: Content[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface LibraryQuery {
+  limit?: number
+  offset?: number
+  sort?: "downloaded_at" | "title" | "duration_seconds"
+  order?: "asc" | "desc"
+  source?: string
+  watch_id?: string
+  kind?: "video" | "audio"
+  q?: string
+}
+
 export interface BackendCookies {
   present: boolean
   count: number
@@ -321,6 +366,22 @@ export const backend = {
       MediaSettings,
   ) => call<BackendSettings>("POST", "/api/settings", b),
   files: () => call<BackendFile[]>("GET", "/api/files"),
+  library: (query: LibraryQuery = {}) => {
+    const qs = new URLSearchParams()
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null && v !== "") qs.set(k, String(v))
+    }
+    const suffix = qs.toString() ? `?${qs}` : ""
+    return call<LibraryPage>("GET", `/api/library${suffix}`)
+  },
+  libraryItem: (id: string) => call<Content & { error?: string }>("GET", `/api/library/${id}`),
+  deleteContent: (id: string, deleteFile: boolean) =>
+    call<{ removed?: boolean; file_removed?: boolean; error?: string }>(
+      "DELETE",
+      `/api/library/${id}?delete_file=${deleteFile ? "true" : "false"}`,
+    ),
+  rescanLibrary: () => call<{ job_id: string; status: string }>("POST", "/api/library/rescan"),
+  streamUrl: (id: string) => `/api/library/${id}/stream`,
   disk: () => call<BackendDisk>("GET", "/api/disk"),
   notifications: () => call<BackendNotifications>("GET", "/api/notifications"),
   saveNotifications: (b: {
