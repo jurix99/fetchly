@@ -11,10 +11,11 @@ export function StatusBadge({
   className?: string
 }) {
   const meta = STATUS_META[status]
+  const Icon = meta.icon
   return (
     <Badge variant="outline" className={cn("gap-1.5", meta.className, className)}>
-      <span className={cn("size-1.5 rounded-full", meta.dot)} />
-      {meta.label}
+      <Icon className={meta.iconClassName} aria-hidden="true" />
+      <span className={cn(meta.strike && "line-through")}>{meta.label}</span>
     </Badge>
   )
 }

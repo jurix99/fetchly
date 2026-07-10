@@ -3,12 +3,14 @@
  * is served by FastAPI, so "/api/..." hits the real server.
  */
 
+import type { SubscriptionFilters } from "@/lib/types"
+
 export interface BackendJob {
   id: string
   url: string
   kind: "manual" | "watch"
   quality: string
-  status: "queued" | "running" | "done" | "error"
+  status: "queued" | "running" | "paused" | "done" | "error" | "canceled"
   phase?: "downloading" | "processing"
   total: number
   completed: number
@@ -18,9 +20,34 @@ export interface BackendJob {
   current_percent: number
   current_speed: string
   files: string[]
+  error?: string
   playlist_title?: string
   watch_id?: string | null
   created_at: number
+  paused_at?: number | null
+  canceled_at?: number | null
+  finished_at?: number | null
+  reports?: { plugin?: string; label: string; ok: boolean; detail?: string }[]
+}
+
+/** Content filters as the API stores them (snake_case; durations in SECONDS). */
+export interface BackendFilters {
+  min_duration?: number | null
+  max_duration?: number | null
+  exclude_shorts: boolean
+  exclude_lives: boolean
+  include_keywords: string[]
+  exclude_keywords: string[]
+  keep_last_n?: number | null
+}
+
+/** Effect of the filters at the last check, surfaced on the subscription card. */
+export interface BackendLastCheck {
+  listed: number
+  matched: number
+  rejected_by_filters: number
+  downloaded: number
+  at?: string
 }
 
 export interface BackendWatch {
@@ -31,6 +58,8 @@ export interface BackendWatch {
   date_after?: string
   exclude_shorts?: boolean
   exclude_lives?: boolean
+  filters?: BackendFilters
+  last_check?: BackendLastCheck | null
   title: string
   thumbnail?: string | null
   enabled: boolean
@@ -39,6 +68,14 @@ export interface BackendWatch {
   total?: number
   last_checked: string | null
   last_result: string
+}
+
+export interface PreviewFiltersResult {
+  listed: number
+  kept: number
+  rejected: number
+  rejections: { title: string; reason: string }[]
+  error?: string
 }
 
 export interface BackendSettings {
@@ -103,6 +140,41 @@ export interface SubscribedChannel {
   name: string
   avatar?: string
   followed?: boolean
+}
+
+export type PluginFieldType = "bool" | "str" | "int" | "select"
+
+export interface PluginField {
+  key: string
+  type: PluginFieldType
+  label: string
+  help: string
+  default: unknown
+  options: string[] | null
+  secret?: boolean
+}
+
+export interface PluginAction {
+  id: string
+  label: string
+  kind: "generic" | "test" | "backfill"
+  confirm: boolean
+}
+
+export interface PluginInfo {
+  id: string
+  name: string
+  type: "source" | "processor" | "output" | "unknown"
+  version: string
+  description: string
+  builtin: boolean
+  critical: boolean
+  enabled: boolean
+  status: "active" | "disabled" | "error"
+  error: string
+  settings_schema: PluginField[]
+  actions: PluginAction[]
+  settings: Record<string, unknown>
 }
 
 export interface BackendCookies {
@@ -174,10 +246,25 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return res.json().catch(() => ({})) as Promise<T>
 }
 
+/** Result of a job-control call; carries `error` (+ HTTP 409) on invalid transitions. */
+export interface JobActionResult {
+  status?: string
+  error?: string
+}
+
 export const backend = {
   jobs: () => call<BackendJob[]>("GET", "/api/jobs"),
+  jobsRestored: () => call<{ count: number; at: number }>("GET", "/api/jobs/restored"),
+  jobStatus: (id: string) =>
+    call<{ status?: string; log?: string[]; error?: string }>("GET", `/api/status/${id}`),
   download: (b: { url: string; quality: string; format: string; subfolder?: string }) =>
     call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
+  pauseJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/pause`),
+  resumeJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/resume`),
+  cancelJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/cancel`),
+  retryJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/retry`),
+  pauseAll: () => call<{ paused: number }>("POST", "/api/jobs/pause-all"),
+  resumeAll: () => call<{ resumed: number }>("POST", "/api/jobs/resume-all"),
   extract: (url: string, limit?: number) =>
     call<ExtractResult>("POST", "/api/extract", { url, limit }),
   channelInfo: (url: string) => call<ChannelInfoResult>("POST", "/api/channel", { url }),
@@ -195,6 +282,7 @@ export const backend = {
     thumbnail?: string
     exclude_shorts?: boolean
     exclude_lives?: boolean
+    filters?: BackendFilters
   }) => call<BackendWatch & { error?: string }>("POST", "/api/watches", b),
   patchWatch: (
     id: string,
@@ -205,10 +293,13 @@ export const backend = {
       date_after: string
       exclude_shorts: boolean
       exclude_lives: boolean
+      filters: BackendFilters
     }>,
   ) => call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
   removeWatch: (id: string) => call<{ removed: boolean }>("DELETE", `/api/watches/${id}`),
   checkWatch: (id: string) => call<{ status: string }>("POST", `/api/watches/${id}/check`),
+  previewFilters: (url: string, filters: BackendFilters) =>
+    call<PreviewFiltersResult>("POST", "/api/watches/preview-filters", { url, filters }),
   youtubeSubscriptions: () =>
     call<{ channels?: SubscribedChannel[]; error?: string }>(
       "GET",
@@ -241,6 +332,23 @@ export const backend = {
   }) => call<BackendNotifications>("POST", "/api/notifications", b),
   testNotifications: (b: { urls?: string[] }) =>
     call<{ ok: boolean; message: string }>("POST", "/api/notifications/test", b),
+  plugins: () => call<PluginInfo[]>("GET", "/api/plugins"),
+  enablePlugin: (id: string) =>
+    call<{ id?: string; enabled?: boolean; error?: string }>("POST", `/api/plugins/${id}/enable`),
+  disablePlugin: (id: string) =>
+    call<{ id?: string; enabled?: boolean; error?: string }>("POST", `/api/plugins/${id}/disable`),
+  savePluginSettings: (id: string, settings: Record<string, unknown>) =>
+    call<{ id?: string; settings?: Record<string, unknown>; error?: string }>(
+      "PATCH",
+      `/api/plugins/${id}/settings`,
+      { settings },
+    ),
+  runPluginAction: (id: string, action: string, body?: Record<string, unknown>) =>
+    call<{ ok?: boolean; message?: string; job_id?: string; error?: string }>(
+      "POST",
+      `/api/plugins/${id}/actions/${action}`,
+      body ?? {},
+    ),
   cookies: () => call<BackendCookies>("GET", "/api/cookies"),
   saveCookies: (content: string) =>
     call<BackendCookies & { ok: boolean; message: string }>("POST", "/api/cookies", { content }),
@@ -272,3 +380,31 @@ const FRONTEND_QUALITIES = ["Auto", "2160p (4K)", "1440p", "1080p", "720p", "480
 export const qualityToBackend = (q: string) => Q_TO_BACKEND[q] ?? q
 export const qualityToFrontend = (q: string | null | undefined) =>
   (q && (Q_TO_FRONTEND[q] ?? (FRONTEND_QUALITIES.includes(q) ? q : "Auto"))) || "Auto"
+
+// --- subscription filters mapping (frontend minutes <-> backend seconds) ---
+
+/** UI filters (durations in MINUTES) → API filters (durations in SECONDS). */
+export function filtersToBackend(f: SubscriptionFilters): BackendFilters {
+  return {
+    min_duration: f.minDuration != null ? Math.round(f.minDuration * 60) : null,
+    max_duration: f.maxDuration != null ? Math.round(f.maxDuration * 60) : null,
+    exclude_shorts: !!f.excludeShorts,
+    exclude_lives: !!f.excludeLives,
+    include_keywords: f.includeKeywords ?? [],
+    exclude_keywords: f.excludeKeywords ?? [],
+    keep_last_n: f.keepLastN != null ? f.keepLastN : null,
+  }
+}
+
+/** API filters (SECONDS) → UI filters (MINUTES). Missing object = no filters. */
+export function filtersToFrontend(b?: BackendFilters | null): SubscriptionFilters {
+  return {
+    minDuration: b?.min_duration != null ? Math.round(b.min_duration / 60) : undefined,
+    maxDuration: b?.max_duration != null ? Math.round(b.max_duration / 60) : undefined,
+    excludeShorts: !!b?.exclude_shorts,
+    excludeLives: !!b?.exclude_lives,
+    includeKeywords: b?.include_keywords ?? [],
+    excludeKeywords: b?.exclude_keywords ?? [],
+    keepLastN: b?.keep_last_n != null ? b.keep_last_n : undefined,
+  }
+}

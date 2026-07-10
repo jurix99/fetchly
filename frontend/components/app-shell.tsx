@@ -23,7 +23,7 @@ export function AppShell() {
         <main className="flex-1 overflow-y-auto">
           {view === "home" && <HomeView onNavigate={setView} />}
           {view === "youtube" && <YoutubeView />}
-          {view === "downloads" && <DownloadsView />}
+          {view === "downloads" && <DownloadsView onNavigate={setView} />}
           {view === "settings" && <SettingsView />}
         </main>
       </div>

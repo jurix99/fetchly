@@ -182,6 +182,7 @@ def add_watch(
     thumbnail: str = "",
     exclude_shorts: bool = False,
     exclude_lives: bool = False,
+    filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with _LOCK:
         cfg = _read()
@@ -191,8 +192,11 @@ def add_watch(
             "quality": quality,  # None -> resolve to default at check time
             "subfolder": subfolder,  # optional destination folder under /downloads
             "date_after": date_after,  # ISO date; only sync newer uploads
+            # Legacy mirror of the two toggles (some readers still use them);
+            # `filters` is the canonical, full content-filter object.
             "exclude_shorts": bool(exclude_shorts),  # skip the /shorts tab
             "exclude_lives": bool(exclude_lives),  # skip live streams / premieres
+            "filters": filters or {},
             "title": title,  # known channel name (refreshed on first sync)
             "thumbnail": thumbnail,  # known channel avatar (refreshed on sync)
             "enabled": True,
@@ -202,6 +206,9 @@ def add_watch(
             "total": 0,
             "last_checked": None,
             "last_result": "Never checked",
+            # Effect of the filters at the last check (see main._do_watch_check).
+            "last_check": None,
+            "output_dir": "",  # where files landed (for keepLastN across checks)
         }
         cfg["watches"].append(watch)
         _write(cfg)
@@ -233,6 +240,32 @@ def get_watch(watch_id: str) -> dict[str, Any] | None:
         if watch["id"] == watch_id:
             return watch
     return None
+
+
+# --- Plugin state (enabled + settings), persisted under config["plugins"] ---
+def all_plugin_states() -> dict[str, Any]:
+    return get_config().get("plugins") or {}
+
+
+def get_plugin_state(plugin_id: str) -> dict[str, Any]:
+    return all_plugin_states().get(plugin_id) or {}
+
+
+def set_plugin_state(
+    plugin_id: str,
+    enabled: bool | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with _LOCK:
+        cfg = _read()
+        plugins = cfg.setdefault("plugins", {})
+        entry = plugins.setdefault(plugin_id, {})
+        if enabled is not None:
+            entry["enabled"] = bool(enabled)
+        if settings is not None:
+            entry["settings"] = {**(entry.get("settings") or {}), **settings}
+        _write(cfg)
+        return entry
 
 
 # --- Per-watch sync memory -------------------------------------------------

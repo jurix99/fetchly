@@ -21,7 +21,8 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
+import { InlineFeedback } from "@/components/inline-feedback"
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -54,6 +55,7 @@ export function SubscriptionsPanel() {
     removeSubscription,
   } = useStore()
   const [editing, setEditing] = useState<Subscription | null>(null)
+  const [removing, setRemoving] = useState<Subscription | null>(null)
   const [sort, setSort] = useState<SortKey>("recent")
   const [showChannels, setShowChannels] = useState(true)
   const [showPlaylists, setShowPlaylists] = useState(true)
@@ -75,18 +77,12 @@ export function SubscriptionsPanel() {
 
   if (subscriptions.length === 0) {
     return (
-      <Empty className="border">
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <BellIcon />
-          </EmptyMedia>
-          <EmptyTitle>Aucun abonnement</EmptyTitle>
-          <EmptyDescription>
-            Suivez une chaîne ou une playlist depuis l&apos;onglet Explorer pour
-            télécharger automatiquement les nouvelles vidéos.
-          </EmptyDescription>
-        </EmptyHeader>
-      </Empty>
+      <InlineFeedback
+        state="empty"
+        icon={BellIcon}
+        title="Aucun abonnement"
+        description="Suivez une chaîne ou une playlist depuis l'onglet Explorer pour télécharger automatiquement les nouvelles vidéos."
+      />
     )
   }
 
@@ -145,17 +141,12 @@ export function SubscriptionsPanel() {
       </div>
 
       {visible.length === 0 ? (
-        <Empty className="border">
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <ListFilterIcon />
-            </EmptyMedia>
-            <EmptyTitle>Aucun résultat</EmptyTitle>
-            <EmptyDescription>
-              Aucun abonnement ne correspond au filtre sélectionné.
-            </EmptyDescription>
-          </EmptyHeader>
-        </Empty>
+        <InlineFeedback
+          state="empty"
+          icon={ListFilterIcon}
+          title="Aucun résultat"
+          description="Aucun abonnement ne correspond au filtre sélectionné."
+        />
       ) : null}
 
       {visible.map((sub) => {
@@ -190,6 +181,15 @@ export function SubscriptionsPanel() {
                     {sub.defaultQuality} · {sub.defaultFormat}
                   </span>
                 </div>
+                {sub.lastCheck && (sub.lastCheck.listed > 0 || sub.lastCheck.downloaded > 0) && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {sub.lastCheck.listed} listée{sub.lastCheck.listed > 1 ? "s" : ""} ·{" "}
+                    {sub.lastCheck.rejectedByFilters} filtrée
+                    {sub.lastCheck.rejectedByFilters > 1 ? "s" : ""} ·{" "}
+                    {sub.lastCheck.downloaded} téléchargée
+                    {sub.lastCheck.downloaded > 1 ? "s" : ""}
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-1">
                 <Switch
@@ -273,7 +273,7 @@ export function SubscriptionsPanel() {
                 size="sm"
                 variant="ghost"
                 className="ml-auto text-destructive"
-                onClick={() => removeSubscription(sub.id)}
+                onClick={() => setRemoving(sub)}
               >
                 <Trash2Icon data-icon="inline-start" />
                 Retirer
@@ -288,6 +288,19 @@ export function SubscriptionsPanel() {
         subscription={editing}
         open={!!editing}
         onOpenChange={(o) => !o && setEditing(null)}
+      />
+
+      <ConfirmDialog
+        open={!!removing}
+        onOpenChange={(o) => !o && setRemoving(null)}
+        title="Retirer l'abonnement ?"
+        description={
+          removing
+            ? `« ${removing.name} » ne sera plus synchronisé. Les vidéos déjà téléchargées sont conservées.`
+            : undefined
+        }
+        confirmLabel="Retirer"
+        onConfirm={() => removing && removeSubscription(removing.id)}
       />
     </div>
   )

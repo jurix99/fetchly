@@ -37,6 +37,7 @@ import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Skeleton } from "@/components/ui/skeleton"
+import { InlineFeedback } from "@/components/inline-feedback"
 import { QualitySelect, FormatSelect } from "@/components/option-selects"
 import { VideoPreviewCard } from "@/components/video-preview-card"
 import { Separator } from "@/components/ui/separator"
@@ -296,14 +297,12 @@ export function YoutubeView() {
           )}
 
           {!result && !loading && (
-            <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border py-12 text-center">
-              <VideoIcon className="size-8 text-muted-foreground" />
-              <p className="text-sm font-medium">Rien à afficher</p>
-              <p className="max-w-xs text-balance text-sm text-muted-foreground">
-                Tapez le nom d&apos;un youtubeur ou d&apos;une vidéo, ou collez une
-                URL pour commencer.
-              </p>
-            </div>
+            <InlineFeedback
+              state="empty"
+              icon={VideoIcon}
+              title="Rien à afficher"
+              description="Tapez le nom d'un youtubeur ou d'une vidéo, ou collez une URL pour commencer."
+            />
           )}
         </TabsContent>
 
@@ -519,10 +518,12 @@ function SearchResults({
 }) {
   if (videos.length === 0 && channels.length === 0) {
     return (
-      <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border py-12 text-center">
-        <SearchIcon className="size-8 text-muted-foreground" />
-        <p className="text-sm font-medium">Aucun résultat</p>
-      </div>
+      <InlineFeedback
+        state="empty"
+        icon={SearchIcon}
+        title="Aucun résultat"
+        description="Essayez d'autres mots-clés ou collez une URL directe."
+      />
     )
   }
 

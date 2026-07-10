@@ -6,8 +6,8 @@ import { HardDriveIcon, TriangleAlertIcon } from "lucide-react"
 import { backend, type BackendDisk } from "@/lib/backend"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
+import { InlineFeedback } from "@/components/inline-feedback"
 
 /**
  * Disk usage of the downloads volume + the "minimum free space" guard. Below the
@@ -51,6 +51,7 @@ export function DiskCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {!disk && <InlineFeedback state="loading" rows={2} />}
         {disk && (
           <div className="flex flex-col gap-2">
             <Progress value={disk.percent} />
