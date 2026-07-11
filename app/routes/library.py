@@ -23,11 +23,11 @@ _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 async def list_library(
     limit: int = 40, offset: int = 0, sort: str = "downloaded_at", order: str = "desc",
     source: str | None = None, watch_id: str | None = None,
-    kind: str | None = None, q: str | None = None,
+    kind: str | None = None, q: str | None = None, transcribed: str | None = None,
 ) -> JSONResponse:
     rows, total = db.content_list(
         limit=limit, offset=offset, sort=sort, order=order,
-        source=source, watch_id=watch_id, kind=kind, q=q,
+        source=source, watch_id=watch_id, kind=kind, q=q, transcribed=transcribed,
     )
     return JSONResponse(
         {

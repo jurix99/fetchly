@@ -5,5 +5,15 @@ python-multipart==0.0.20
 # ntfy, Pushover, Slack, SMS via Twilio/Vonage, …). Used to alert when a video
 # finishes downloading; services are configured as simple URLs in the settings.
 apprise==1.9.2
+# Local speech-to-text (CTranslate2 backend). Pulls ctranslate2 + PyAV +
+# huggingface-hub + onnxruntime (VAD). Runs on CPU (int8) or CUDA GPU if present.
+# Models are downloaded on first use into /config/models (persistent volume).
+faster-whisper==1.0.3
+# Local hybrid search: FTS5 (bundled with SQLite) + semantic embeddings.
+# fastembed = ONNX embeddings, no torch (keeps the image light); sqlite-vec is a
+# loadable SQLite extension for vector KNN. Both fully in-process — no external
+# search service. Embedding model downloaded on first use into /config/models.
+fastembed==0.3.6
+sqlite-vec==0.1.6
 # yt-dlp is installed separately in the Dockerfile (latest nightly) because
 # YouTube breaks older versions frequently and fixes land in nightly first.

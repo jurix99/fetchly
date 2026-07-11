@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.4] - 2026-07-12
+
+Phase 2 — Fetchly stops being just a downloader and becomes a searchable media
+library: a real Library view with an integrated player, automatic local
+transcription, and hybrid (keyword + meaning) search over every second of your
+content. Everything stays in-process — still one container, no external service.
+
+### Added
+
+- **Library** — a first-class **Bibliothèque** view backed by a real content
+  model (SQLite `contents` table), not a per-request disk scan. Grid/list
+  layouts, sort (recent / title / duration) and filters (type, transcription,
+  free-text on title/channel), infinite "load more", skeleton/empty states.
+  Existing downloads are backfilled once on startup and every new download
+  appears automatically; thumbnails are copied locally and served. New
+  endpoints: `GET /api/library`, `GET/DELETE /api/library/{id}` (remove entry
+  only, or entry + file — two distinct confirmations), `POST /api/library/rescan`.
+- **Integrated player** — HTML5 video/audio with **HTTP Range** streaming
+  (`GET /api/library/{id}/stream`, path-traversal guarded) for instant seek,
+  keyboard shortcuts (space, ±5 s), and a start-at timestamp (`?content=<id>&t=<s>`).
+  A content detail page shows metadata, "open original", copyable file path,
+  re-download when a file is missing, and a tabbed layout (Aperçu · Transcript).
+- **Local transcription (Whisper)** — a builtin **processor plugin**
+  (faster-whisper / CTranslate2, CPU int8 or CUDA GPU auto-detected) transcribes
+  each download on a **dedicated queue** separate from the download pool: FIFO,
+  optional **nightly window**, resume-after-restart, one model resident at a time
+  (unloaded when idle). Produces `.srt` + `.vtt` sidecars and timestamped
+  segments; detects the language. The Transcript tab gets clickable timestamps
+  (seek), karaoke-style highlight during playback, local search, and .srt/.vtt
+  download. Settings: model, language, hardware, VAD, schedule, `keep last N`,
+  and `skip if captions`. Endpoints: `POST /api/transcripts/backfill`,
+  `POST /api/library/{id}/transcribe`, `GET /api/transcript-jobs`,
+  `POST /api/transcript-jobs/{id}/cancel`, `GET /api/library/{id}/transcript`.
+- **Hybrid search** — every second of the library is searchable by **keyword
+  and by meaning**, fully in-process (SQLite FTS5 + sqlite-vec, no external
+  search engine). Accent-insensitive full text (`remove_diacritics 2`) over
+  transcripts + metadata, plus local ONNX embeddings (fastembed, no torch) over
+  ~45 s semantic chunks, fused with Reciprocal Rank Fusion. A reformulation
+  ("protéger ses identifiants") finds the same passage as the exact words, and
+  queries work **across languages**. `GET /api/search`, `GET /api/index/stats`,
+  `POST /api/index/backfill`, `POST /api/index/rebuild`.
+- **Import existing subtitles** — content that only has source `.srt`/`.vtt`
+  (never run through Whisper) is parsed into segments and indexed, so it's
+  searchable too — no re-transcription.
+
+### Changed
+
+- **Source-agnostic navigation** — the sidebar no longer mentions YouTube: the
+  source is now a **badge** on cards (multi-source ready). **Bibliothèque** and
+  **Abonnements** are promoted to top-level entries; the former YouTube view is
+  renamed **Explorer** (unchanged functionally). The Downloads view gains a
+  **Transcriptions** section and the "active" counter now includes them.
+
+### Notes
+
+- Transcription and search models are downloaded on first use into
+  `/config/models` (persistent). Semantic search embeds the query on CPU
+  (~150–200 ms/query) with a one-time model warm-up; lexical search is a few ms.
+- Embedding model: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+  (384-dim, multilingual, ONNX — no torch).
+
 ## [0.0.3] - 2026-07-10
 
 ### Added
@@ -211,5 +272,7 @@ subscriptions. Runs as a single Docker image (plus a PO-token sidecar).
 - The stateless backend does not support pausing/cancelling a running download
   or per-subscription content filters; those controls are informational only.
 
+[0.0.4]: https://github.com/OWNER/REPO/releases/tag/v0.0.4
+[0.0.3]: https://github.com/OWNER/REPO/releases/tag/v0.0.3
 [0.0.2]: https://github.com/OWNER/REPO/releases/tag/v0.0.2
 [0.0.1]: https://github.com/OWNER/REPO/releases/tag/v0.0.1

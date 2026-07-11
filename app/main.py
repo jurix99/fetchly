@@ -20,7 +20,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import db, jobs, library, store, watches
+from . import db, jobs, library, store, transcribe, watches
 from .plugins.registry import registry
 from .runtime import DOWNLOAD_DIR, WEB_DIR
 from .routes import (
@@ -29,8 +29,10 @@ from .routes import (
     files,
     library as library_routes,
     plugins,
+    search,
     settings,
     system,
+    transcripts,
     watches as watches_routes,
 )
 
@@ -41,7 +43,8 @@ app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
 
 # API routers (registered before the SPA catch-all mount below).
 for module in (
-    downloads, watches_routes, content, settings, files, system, plugins, library_routes,
+    downloads, watches_routes, content, settings, files, system, plugins,
+    library_routes, transcripts, search,
 ):
     app.include_router(module.router)
 
@@ -62,6 +65,8 @@ def _on_startup() -> None:
     # One-time backfill of the library from the existing downloads (guarded by a
     # DB flag; runs in the background so startup isn't blocked).
     library.migrate_existing()
+    # Restore the transcription queue (running → re-queued) and start its worker.
+    transcribe.restore_and_start()
 
 
 # Mounted LAST so the API routes take precedence; serves the built SPA.

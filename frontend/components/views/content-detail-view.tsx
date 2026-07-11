@@ -1,22 +1,28 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ArrowLeftIcon,
   CopyIcon,
+  DownloadIcon,
   ExternalLinkIcon,
   FileTextIcon,
+  Loader2Icon,
   RotateCcwIcon,
+  SearchIcon,
   TriangleAlertIcon,
   Trash2Icon,
 } from "lucide-react"
 import { toast } from "sonner"
 
-import { backend, type Content } from "@/lib/backend"
+import { cn } from "@/lib/utils"
+import { backend, type Content, type TranscriptDetail } from "@/lib/backend"
 import type { View } from "@/components/app-shell"
 import { useStore } from "@/components/store-provider"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Input } from "@/components/ui/input"
+import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
@@ -62,7 +68,16 @@ export function ContentDetailView({
   const [descOpen, setDescOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
   const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null)
+
+  function seek(seconds: number) {
+    const el = mediaRef.current
+    if (el) {
+      el.currentTime = seconds
+      el.play().catch(() => {})
+    }
+  }
 
   useEffect(() => {
     let alive = true
@@ -205,6 +220,7 @@ export function ContentDetailView({
             src={content.stream_url}
             controls
             onLoadedMetadata={onLoadedMetadata}
+            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
             className="w-full"
           />
         </div>
@@ -215,6 +231,7 @@ export function ContentDetailView({
           poster={content.thumbnail_url ?? undefined}
           controls
           onLoadedMetadata={onLoadedMetadata}
+          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
           className="aspect-video w-full overflow-hidden rounded-xl bg-black"
         />
       )}
@@ -298,11 +315,11 @@ export function ContentDetailView({
         </TabsContent>
 
         <TabsContent value="transcript">
-          <InlineFeedback
-            state="empty"
-            icon={FileTextIcon}
-            title="Disponible après transcription"
-            description="La transcription de ce contenu apparaîtra ici une fois la fonctionnalité activée."
+          <TranscriptTab
+            contentId={content.id}
+            currentTime={currentTime}
+            onSeek={seek}
+            onNavigate={onNavigate}
           />
         </TabsContent>
       </Tabs>
@@ -335,6 +352,225 @@ export function ContentDetailView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+function fmtMs(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+}
+
+function highlight(text: string, needle: string) {
+  if (!needle) return text
+  const i = text.toLowerCase().indexOf(needle)
+  if (i < 0) return text
+  return (
+    <>
+      {text.slice(0, i)}
+      <mark className="rounded bg-warning/40 text-foreground">{text.slice(i, i + needle.length)}</mark>
+      {text.slice(i + needle.length)}
+    </>
+  )
+}
+
+/** Transcript tab: segment list with clickable timestamps (seek), karaoke
+ *  highlight following playback, local search, copy + .srt/.vtt download. */
+function TranscriptTab({
+  contentId,
+  currentTime,
+  onSeek,
+  onNavigate,
+}: {
+  contentId: string
+  currentTime: number
+  onSeek: (seconds: number) => void
+  onNavigate: (v: View) => void
+}) {
+  const [data, setData] = useState<TranscriptDetail | null>(null)
+  const [pluginEnabled, setPluginEnabled] = useState(true)
+  const [q, setQ] = useState("")
+  const [autoScroll, setAutoScroll] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const activeRef = useRef<HTMLButtonElement>(null)
+
+  const load = useCallback(async () => {
+    try {
+      setData(await backend.getTranscript(contentId))
+    } catch {
+      /* keep previous */
+    }
+  }, [contentId])
+
+  useEffect(() => {
+    load()
+    backend.transcriptsStatus().then((s) => setPluginEnabled(s.enabled)).catch(() => {})
+  }, [load])
+
+  // Poll while a transcription is in progress.
+  useEffect(() => {
+    const st = data?.status
+    if (st === "queued" || st === "running") {
+      const t = setInterval(load, 3000)
+      return () => clearInterval(t)
+    }
+  }, [data?.status, load])
+
+  const segments = data?.segments ?? []
+  const curMs = currentTime * 1000
+  const activeIdx = useMemo(
+    () => segments.findIndex((s) => curMs >= s.start_ms && curMs < s.end_ms),
+    [segments, curMs],
+  )
+
+  useEffect(() => {
+    if (autoScroll && activeRef.current) {
+      activeRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" })
+    }
+  }, [activeIdx, autoScroll])
+
+  async function transcribe() {
+    setBusy(true)
+    try {
+      const r = await backend.transcribeContent(contentId)
+      if (r.error) toast.error(r.error)
+      else toast.success("Transcription lancée")
+      await load()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!data) return <InlineFeedback state="loading" rows={4} />
+
+  const st = data.status
+  if (st === "queued" || st === "running") {
+    return (
+      <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/30 p-4">
+        <div className="flex items-center gap-2 text-sm text-primary">
+          <Loader2Icon className="size-4 animate-spin" />
+          {st === "queued" ? "En file de transcription…" : "Transcription en cours…"}
+        </div>
+        <Progress value={data.job?.progress ?? 0} />
+      </div>
+    )
+  }
+  if (st === "error") {
+    return (
+      <InlineFeedback
+        state="error"
+        title="Échec de la transcription"
+        description={data.job?.error || "Une erreur est survenue."}
+        action={
+          <Button size="sm" variant="outline" onClick={transcribe} disabled={busy}>
+            <RotateCcwIcon data-icon="inline-start" /> Réessayer
+          </Button>
+        }
+      />
+    )
+  }
+  if (segments.length === 0) {
+    return pluginEnabled ? (
+      <InlineFeedback
+        state="empty"
+        icon={FileTextIcon}
+        title="Pas encore de transcription"
+        description="Générez la transcription pour obtenir des sous-titres et une recherche horodatée."
+        action={
+          <Button size="sm" onClick={transcribe} disabled={busy}>
+            <FileTextIcon data-icon="inline-start" /> Transcrire maintenant
+          </Button>
+        }
+      />
+    ) : (
+      <InlineFeedback
+        state="empty"
+        icon={FileTextIcon}
+        title="Plugin Whisper désactivé"
+        description="Activez le plugin de transcription dans les réglages pour transcrire ce contenu."
+        action={
+          <Button size="sm" variant="outline" onClick={() => onNavigate("settings")}>
+            Activer le plugin Whisper
+          </Button>
+        }
+      />
+    )
+  }
+
+  const needle = q.trim().toLowerCase()
+  const rows = segments
+    .map((s, i) => ({ s, i }))
+    .filter(({ s }) => !needle || s.text.toLowerCase().includes(needle))
+
+  return (
+    <div className="flex flex-col gap-2">
+      {data.source_subs && (
+        <p className="text-xs text-muted-foreground">
+          Sous-titres source utilisés (ce contenu a été ignoré par la transcription).
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-40 flex-1">
+          <SearchIcon className="absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Rechercher dans le transcript…"
+            className="h-8 pl-8 text-sm"
+          />
+        </div>
+        <Button
+          size="sm"
+          variant={autoScroll ? "secondary" : "ghost"}
+          onClick={() => setAutoScroll((a) => !a)}
+        >
+          Suivi auto
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() =>
+            navigator.clipboard
+              ?.writeText(segments.map((s) => s.text).join("\n"))
+              .then(() => toast.success("Transcript copié"), () => toast.error("Copie impossible"))
+          }
+        >
+          <CopyIcon data-icon="inline-start" /> Copier
+        </Button>
+        {data.srt_url && (
+          <Button size="sm" variant="ghost" render={<a href={data.srt_url} download />}>
+            <DownloadIcon data-icon="inline-start" /> .srt
+          </Button>
+        )}
+        {data.vtt_url && (
+          <Button size="sm" variant="ghost" render={<a href={data.vtt_url} download />}>
+            <DownloadIcon data-icon="inline-start" /> .vtt
+          </Button>
+        )}
+      </div>
+
+      <div className="flex max-h-[55vh] flex-col overflow-y-auto rounded-lg border border-border">
+        {rows.map(({ s, i }) => (
+          <button
+            key={i}
+            ref={i === activeIdx ? activeRef : undefined}
+            type="button"
+            onClick={() => onSeek(s.start_ms / 1000)}
+            className={cn(
+              "flex gap-3 border-b border-border/50 px-3 py-1.5 text-left text-sm transition-colors last:border-0 hover:bg-muted/50",
+              i === activeIdx && "bg-primary/10",
+            )}
+          >
+            <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-primary">
+              {fmtMs(s.start_ms)}
+            </span>
+            <span className="text-foreground/90">{highlight(s.text, needle)}</span>
+          </button>
+        ))}
+        {rows.length === 0 && (
+          <p className="p-3 text-center text-sm text-muted-foreground">Aucun résultat.</p>
+        )}
+      </div>
     </div>
   )
 }

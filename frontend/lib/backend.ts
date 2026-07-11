@@ -220,6 +220,83 @@ export interface LibraryQuery {
   watch_id?: string
   kind?: "video" | "audio"
   q?: string
+  transcribed?: "yes" | "no"
+}
+
+export interface TranscriptSegment {
+  start_ms: number
+  end_ms: number
+  text: string
+}
+
+export interface TranscriptJob {
+  id: string
+  content_id: string
+  title: string
+  status: "queued" | "running" | "done" | "error" | "canceled"
+  progress: number
+  model: string
+  created_at: number
+  duration_ms?: number | null
+  error?: string
+}
+
+export interface TranscriptStatusInfo {
+  enabled: boolean
+  device: string
+  model: string
+  model_size: string
+  last_speed: string | null
+  active: number
+  schedule: string
+  window_open: boolean
+}
+
+export interface TranscriptDetail {
+  status: TranscriptStatus
+  language: string | null
+  segments: TranscriptSegment[]
+  source_subs: boolean
+  srt_url: string | null
+  vtt_url: string | null
+  job: TranscriptJob | null
+  error?: string
+}
+
+export interface IndexStats {
+  total: number
+  indexed: number
+  chunks: number
+  db_bytes: number
+  vec_ok: boolean
+  semantic: boolean
+  embedding_model: string
+  embedding_lang: string
+}
+
+export interface SearchPassage {
+  start_ms: number
+  text: string
+  match_type: "lexical" | "semantic"
+  score: number
+}
+
+export interface LibrarySearchResult {
+  id: string
+  title: string
+  channel: string
+  source: string
+  duration_seconds: number | null
+  thumbnail_url: string | null
+  score: number
+  passages: SearchPassage[]
+}
+
+export interface LibrarySearchResponse {
+  query: string
+  took_ms: number
+  count: number
+  results: LibrarySearchResult[]
 }
 
 export interface BackendCookies {
@@ -382,6 +459,24 @@ export const backend = {
     ),
   rescanLibrary: () => call<{ job_id: string; status: string }>("POST", "/api/library/rescan"),
   streamUrl: (id: string) => `/api/library/${id}/stream`,
+  // --- transcription ---
+  transcriptsStatus: () => call<TranscriptStatusInfo>("GET", "/api/transcripts/status"),
+  transcriptJobs: () => call<TranscriptJob[]>("GET", "/api/transcript-jobs"),
+  cancelTranscriptJob: (id: string) =>
+    call<{ status?: string; error?: string }>("POST", `/api/transcript-jobs/${id}/cancel`),
+  transcribeContent: (id: string) =>
+    call<{ job_id?: string; error?: string }>("POST", `/api/library/${id}/transcribe`),
+  getTranscript: (id: string) => call<TranscriptDetail>("GET", `/api/library/${id}/transcript`),
+  backfillTranscripts: (onlyMissing = true) =>
+    call<{ queued: number }>("POST", "/api/transcripts/backfill", { only_missing: onlyMissing }),
+  // --- search & index ---
+  searchLibrary: (q: string, scope = "all", limit = 20) => {
+    const qs = new URLSearchParams({ q, scope, limit: String(limit) })
+    return call<LibrarySearchResponse>("GET", `/api/search?${qs}`)
+  },
+  indexStats: () => call<IndexStats>("GET", "/api/index/stats"),
+  indexBackfill: () => call<{ job_id: string }>("POST", "/api/index/backfill"),
+  indexRebuild: () => call<{ job_id: string }>("POST", "/api/index/rebuild"),
   disk: () => call<BackendDisk>("GET", "/api/disk"),
   notifications: () => call<BackendNotifications>("GET", "/api/notifications"),
   saveNotifications: (b: {

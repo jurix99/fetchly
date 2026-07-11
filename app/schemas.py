@@ -115,6 +115,10 @@ class PluginSettingsRequest(BaseModel):
     settings: dict = {}
 
 
+class BackfillRequest(BaseModel):
+    only_missing: bool = True
+
+
 # Default filter template (mirrors the source plugin's _DEFAULT_FILTERS).
 DEFAULT_FILTERS = {
     "min_duration": None,
