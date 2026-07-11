@@ -21,6 +21,7 @@ import {
   type BackendJob,
   type BackendSettings,
   type BackendWatch,
+  type TranscriptJob,
 } from "@/lib/backend"
 import type { DownloadItem, DownloadStatus, Settings, Subscription } from "@/lib/types"
 
@@ -46,6 +47,9 @@ interface StoreValue {
   restoredCount: number
   dismissRestored: () => void
   activeCount: number
+  transcriptJobs: TranscriptJob[]
+  transcriptActiveCount: number
+  cancelTranscript: (id: string) => void
   totalSpeed: string
   addDownload: (options: StartDownloadOptions) => Promise<void>
   pauseDownload: (id: string) => void
@@ -186,6 +190,7 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [jobs, setJobs] = useState<BackendJob[]>([])
+  const [transcriptJobs, setTranscriptJobs] = useState<TranscriptJob[]>([])
   const [watches, setWatches] = useState<BackendWatch[]>([])
   const [bset, setBset] = useState<BackendSettings | null>(null)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
@@ -213,6 +218,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const checking = useRef<Set<string>>(new Set())
 
   const refreshJobs = useCallback(() => backend.jobs().then(setJobs).catch(() => {}), [])
+  const refreshTranscripts = useCallback(
+    () => backend.transcriptJobs().then(setTranscriptJobs).catch(() => {}),
+    [],
+  )
   const refreshWatches = useCallback(() => backend.watches().then(setWatches).catch(() => {}), [])
 
   useEffect(() => {
@@ -221,14 +230,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // the banner shows on load and doesn't reappear after the user dismisses it.
     backend.jobsRestored().then((r) => setRestoredCount(r.count || 0)).catch(() => {})
     refreshJobs()
+    refreshTranscripts()
     refreshWatches()
     const t1 = setInterval(refreshJobs, 1500)
     const t2 = setInterval(refreshWatches, 8000)
+    const t3 = setInterval(refreshTranscripts, 2000)
     return () => {
       clearInterval(t1)
       clearInterval(t2)
+      clearInterval(t3)
     }
-  }, [refreshJobs, refreshWatches])
+  }, [refreshJobs, refreshWatches, refreshTranscripts])
 
   // Drop an optimistic override once the server's real status matches it (or the
   // job settled into a terminal state), so stale overrides never stick.
@@ -449,6 +461,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [])
   const reorderDownloads = useCallback(() => {}, [])
 
+  const cancelTranscript = useCallback(
+    (id: string) => {
+      backend.cancelTranscriptJob(id).then(refreshTranscripts).catch(() => {})
+    },
+    [refreshTranscripts],
+  )
+
   const pauseAll = useCallback(() => {
     backend
       .pauseAll()
@@ -610,6 +629,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     restoredCount,
     dismissRestored,
     activeCount,
+    transcriptJobs,
+    transcriptActiveCount: transcriptJobs.filter(
+      (t) => t.status === "queued" || t.status === "running",
+    ).length,
+    cancelTranscript,
     totalSpeed,
     addDownload,
     pauseDownload,

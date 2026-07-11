@@ -24,6 +24,7 @@ import {
   type PluginAction,
   type PluginField,
   type PluginInfo,
+  type TranscriptStatusInfo,
 } from "@/lib/backend"
 import { ConfirmDialog } from "@/components/confirm-dialog"
 import { Badge } from "@/components/ui/badge"
@@ -294,6 +295,8 @@ function PluginSettingsDialog({
         </DialogHeader>
 
         <div className="flex flex-col gap-4 py-2">
+          {plugin?.id === "whisper" && <WhisperStatusCard values={values} />}
+
           {(plugin?.settings_schema ?? []).map((field, i) => (
             <div key={field.key}>
               {i > 0 && <Separator className="mb-4" />}
@@ -305,7 +308,7 @@ function PluginSettingsDialog({
             </div>
           ))}
 
-          {(plugin?.actions ?? []).length > 0 && (
+          {plugin?.id !== "whisper" && (plugin?.actions ?? []).length > 0 && (
             <>
               <Separator />
               <div className="flex flex-col gap-3">
@@ -400,6 +403,77 @@ function PluginFieldInput({
         />
       )}
       {field.help && <p className="text-xs text-muted-foreground">{field.help}</p>}
+    </div>
+  )
+}
+
+/** Whisper-specific status header: detected hardware, active model + size,
+ *  measured speed, plus the "transcribe the whole library" action. */
+function WhisperStatusCard({ values }: { values: Record<string, unknown> }) {
+  const [status, setStatus] = useState<TranscriptStatusInfo | null>(null)
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [count, setCount] = useState<number | null>(null)
+
+  useEffect(() => {
+    backend.transcriptsStatus().then(setStatus).catch(() => {})
+  }, [])
+
+  async function openConfirm() {
+    try {
+      setCount((await backend.library({ limit: 1 })).total)
+    } catch {
+      setCount(null)
+    }
+    setConfirmOpen(true)
+  }
+
+  async function run() {
+    try {
+      const r = await backend.backfillTranscripts(true)
+      toast.success(`${r.queued} transcription(s) mises en file`)
+    } catch {
+      toast.error("Impossible de lancer la transcription")
+    }
+  }
+
+  const speed = status?.last_speed
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/30 p-3">
+      <div className="grid grid-cols-2 gap-3 text-xs">
+        <Stat label="Matériel détecté" value={status?.device ?? "…"} />
+        <Stat
+          label="Modèle actif"
+          value={status ? `${values.model ?? status.model} ${status.model_size}`.trim() : "…"}
+        />
+        <Stat label="Vitesse mesurée" value={speed ? `~${speed} min de média / min` : "non mesurée"} />
+        <Stat label="Cadence" value={status?.schedule ?? "…"} />
+      </div>
+      <Button size="sm" onClick={openConfirm} className="w-fit">
+        <SparklesIcon data-icon="inline-start" /> Transcrire toute la bibliothèque
+      </Button>
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        variant="default"
+        title="Transcrire toute la bibliothèque ?"
+        description={
+          (count != null
+            ? `Jusqu'à ${count} contenu(s) sans transcript seront mis en file.`
+            : "Les contenus sans transcript seront mis en file.") +
+          (speed ? ` Vitesse mesurée : ~${speed} min de média par minute.` : "")
+        }
+        confirmLabel="Mettre en file"
+        onConfirm={run}
+      />
+    </div>
+  )
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-muted-foreground">{label}</p>
+      <p className="font-medium text-foreground">{value}</p>
     </div>
   )
 }
@@ -528,13 +602,13 @@ function PluginActionButton({
           open={confirmOpen}
           onOpenChange={setConfirmOpen}
           variant="default"
-          title="Générer les métadonnées ?"
+          title={`${action.label} ?`}
           description={
             fileCount === null
-              ? "Génère les fichiers .nfo et visuels pour la bibliothèque existante. Les médias ne sont pas modifiés."
-              : `Génère les .nfo et visuels pour ${fileCount} fichier(s) de la bibliothèque. Les médias ne sont pas modifiés.`
+              ? "Traite les fichiers de la bibliothèque existante. Les médias ne sont pas modifiés."
+              : `Traite ${fileCount} fichier(s) de la bibliothèque. Les médias ne sont pas modifiés.`
           }
-          confirmLabel="Générer"
+          confirmLabel="Lancer"
           onConfirm={run}
         />
       )}

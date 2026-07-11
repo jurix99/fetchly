@@ -2,13 +2,18 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
+  CheckIcon,
+  CircleCheckIcon,
+  ClockIcon,
   CompassIcon,
   FileTextIcon,
   LayoutGridIcon,
   ListIcon,
+  Loader2Icon,
   PlayIcon,
   RefreshCwIcon,
   SearchIcon,
+  TriangleAlertIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -70,6 +75,7 @@ export function LibraryView({
   const [layout, setLayout] = useState<"grid" | "list">("grid")
   const [sort, setSort] = useState<NonNullable<LibraryQuery["sort"]>>("downloaded_at")
   const [kind, setKind] = useState<"all" | "video" | "audio">("all")
+  const [transcribed, setTranscribed] = useState<"all" | "yes" | "no">("all")
   const [q, setQ] = useState("")
 
   const query = useCallback(
@@ -79,9 +85,10 @@ export function LibraryView({
       sort,
       order: sort === "title" ? "asc" : "desc",
       kind: kind === "all" ? undefined : kind,
+      transcribed: transcribed === "all" ? undefined : transcribed,
       q: q.trim() || undefined,
     }),
-    [sort, kind, q],
+    [sort, kind, transcribed, q],
   )
 
   const load = useCallback(async () => {
@@ -169,6 +176,16 @@ export function LibraryView({
               <SelectItem value="audio">Audio</SelectItem>
             </SelectContent>
           </Select>
+          <Select value={transcribed} onValueChange={(v) => setTranscribed((v as "all" | "yes" | "no") ?? "all")}>
+            <SelectTrigger size="sm" className="w-36" aria-label="Transcription">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Transcription</SelectItem>
+              <SelectItem value="yes">Transcrit</SelectItem>
+              <SelectItem value="no">Non transcrit</SelectItem>
+            </SelectContent>
+          </Select>
           <div className="flex items-center rounded-lg border border-border">
             <Button
               size="icon-sm"
@@ -232,24 +249,36 @@ export function LibraryView({
   )
 }
 
-/** Small greyed indicator for a future feature (transcription, prompt 6). */
-function TranscriptDot({ status }: { status: Content["transcript_status"] }) {
-  const done = status === "done"
+/** Live transcription indicator, driven by transcript_status. */
+const TRANSCRIPT_META: Record<
+  string,
+  { icon: typeof FileTextIcon; className: string; label: string; spin?: boolean }
+> = {
+  none: { icon: FileTextIcon, className: "text-muted-foreground/40", label: "Non transcrit" },
+  queued: { icon: ClockIcon, className: "text-muted-foreground", label: "En file de transcription" },
+  running: { icon: Loader2Icon, className: "text-primary", label: "Transcription en cours", spin: true },
+  done: { icon: CircleCheckIcon, className: "text-success", label: "Transcrit" },
+  error: { icon: TriangleAlertIcon, className: "text-destructive", label: "Échec de transcription" },
+  skipped: { icon: CheckIcon, className: "text-muted-foreground", label: "Sous-titres source utilisés" },
+}
+
+function TranscriptDot({ content }: { content: Content }) {
+  const meta = TRANSCRIPT_META[content.transcript_status] ?? TRANSCRIPT_META.none
+  const Icon = meta.icon
+  const transcribed = content.transcript_status === "done" || content.transcript_status === "skipped"
+  const tip = `${transcribed ? "transcrit ✓" : meta.label}${
+    content.index_status === "done" ? " · indexé ✓" : ""
+  }`
   return (
     <Tooltip>
       <TooltipTrigger
         render={
-          <span
-            className={cn(
-              "flex items-center",
-              done ? "text-success" : "text-muted-foreground/40",
-            )}
-          >
-            <FileTextIcon className="size-3.5" />
+          <span className={cn("flex items-center", meta.className)}>
+            <Icon className={cn("size-3.5", meta.spin && "animate-spin")} />
           </span>
         }
       />
-      <TooltipContent>{done ? "Transcrit" : "Transcription à venir"}</TooltipContent>
+      <TooltipContent>{tip}</TooltipContent>
     </Tooltip>
   )
 }
@@ -289,7 +318,7 @@ function GridCard({ content, onOpen }: { content: Content; onOpen: (id: string) 
           <SourceBadge source={content.source} className="text-[10px]" />
           <span className="text-[11px] text-muted-foreground">{relativeDate(content.downloaded_at)}</span>
           <span className="ml-auto">
-            <TranscriptDot status={content.transcript_status} />
+            <TranscriptDot content={content} />
           </span>
         </div>
       </div>
@@ -313,7 +342,7 @@ function ListRow({ content, onOpen }: { content: Content; onOpen: (id: string) =
       <span className="hidden w-20 text-right text-[11px] text-muted-foreground sm:block">
         {relativeDate(content.downloaded_at)}
       </span>
-      <TranscriptDot status={content.transcript_status} />
+      <TranscriptDot content={content} />
     </button>
   )
 }

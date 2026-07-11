@@ -4,6 +4,7 @@ import { useMemo, useState } from "react"
 import {
   CheckIcon,
   DownloadIcon,
+  FileTextIcon,
   FolderOpenIcon,
   GaugeIcon,
   PauseIcon,
@@ -14,7 +15,7 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 
-import { backend } from "@/lib/backend"
+import { backend, type TranscriptJob } from "@/lib/backend"
 import type { DownloadItem, DownloadStatus } from "@/lib/types"
 import type { View } from "@/components/app-shell"
 import { useStore } from "@/components/store-provider"
@@ -54,6 +55,9 @@ export function DownloadsView({ onNavigate }: { onNavigate?: (v: View) => void }
     pauseAll,
     resumeAll,
     clearCompleted,
+    transcriptJobs,
+    transcriptActiveCount,
+    cancelTranscript,
   } = useStore()
   const [filter, setFilter] = useState<Filter>("all")
 
@@ -89,7 +93,7 @@ export function DownloadsView({ onNavigate }: { onNavigate?: (v: View) => void }
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs">
           <DownloadIcon className="size-3.5 text-primary" />
-          <span className="font-medium tabular-nums">{activeCount}</span>
+          <span className="font-medium tabular-nums">{activeCount + transcriptActiveCount}</span>
           <span className="text-muted-foreground">actifs</span>
         </div>
         <div className="flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs">
@@ -147,6 +151,23 @@ export function DownloadsView({ onNavigate }: { onNavigate?: (v: View) => void }
         <div className="flex flex-col gap-3">
           {shown.map((d) => (
             <DownloadRow key={d.id} item={d} />
+          ))}
+        </div>
+      )}
+
+      {transcriptJobs.length > 0 && (
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-2 pt-2">
+            <FileTextIcon className="size-4 text-muted-foreground" />
+            <h2 className="text-sm font-semibold">Transcriptions</h2>
+            {transcriptActiveCount > 0 && (
+              <span className="text-xs text-muted-foreground">
+                {transcriptActiveCount} en cours
+              </span>
+            )}
+          </div>
+          {transcriptJobs.map((t) => (
+            <TranscriptRow key={t.id} job={t} onCancel={cancelTranscript} />
           ))}
         </div>
       )}
@@ -325,6 +346,52 @@ function DownloadRow({ item }: { item: DownloadItem }) {
           </pre>
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+const T_STATUS: Record<TranscriptJob["status"], DownloadStatus> = {
+  queued: "queued",
+  running: "downloading",
+  done: "completed",
+  error: "failed",
+  canceled: "canceled",
+}
+
+function TranscriptRow({
+  job,
+  onCancel,
+}: {
+  job: TranscriptJob
+  onCancel: (id: string) => void
+}) {
+  const active = job.status === "queued" || job.status === "running"
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-3">
+      <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <p className="line-clamp-1 flex-1 text-sm font-medium">
+            {job.title || "Transcription"}
+          </p>
+          <StatusBadge status={T_STATUS[job.status]} />
+        </div>
+        {job.status === "running" && <Progress value={job.progress} className="mt-1.5" />}
+        {job.status === "error" && job.error && (
+          <p className="mt-1 line-clamp-1 text-xs text-destructive">{job.error}</p>
+        )}
+        <p className="mt-1 text-[11px] text-muted-foreground">Modèle {job.model}</p>
+      </div>
+      {active && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="text-destructive"
+          onClick={() => onCancel(job.id)}
+        >
+          <XIcon data-icon="inline-start" /> Annuler
+        </Button>
+      )}
     </div>
   )
 }
