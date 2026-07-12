@@ -126,6 +126,18 @@ class SearchFeedbackRequest(BaseModel):
     clicked: bool = False
 
 
+class IntelligenceRequest(BaseModel):
+    """LLM provider config ("Intelligence"). `api_key` = "__keep__"/None keeps the
+    stored secret; "" clears it. All fields optional for partial updates."""
+    preset: str | None = None
+    protocol: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    style: str | None = None
+    output_language: str | None = None
+
+
 # Default filter template (mirrors the source plugin's _DEFAULT_FILTERS).
 DEFAULT_FILTERS = {
     "min_duration": None,

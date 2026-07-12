@@ -103,12 +103,17 @@ def _media_url(abspath: str | None) -> str | None:
 
 def to_public(row: dict[str, Any]) -> dict[str, Any]:
     """A content row as the API exposes it: adds thumbnail/stream URLs + whether
-    the file is still on disk."""
+    the file is still on disk, and normalizes the generation status."""
     d = dict(row)
     d["thumbnail_url"] = _media_url(row.get("thumbnail_path"))
     d["stream_url"] = f"/api/library/{row['id']}/stream"
     fp = row.get("filepath")
     d["file_exists"] = bool(fp and Path(fp).exists())
+    d["generation_status"] = row.get("generation_status") or "none"
+    try:
+        d["chapter_count"] = db.chapters_count(row["id"]) if row.get("id") else 0
+    except Exception:  # noqa: BLE001
+        d["chapter_count"] = 0
     return d
 
 

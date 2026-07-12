@@ -11,14 +11,17 @@ import {
   PlayIcon,
   RotateCcwIcon,
   SearchIcon,
+  SparklesIcon,
   TriangleAlertIcon,
   Trash2Icon,
+  WandSparklesIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
 import {
   backend,
+  type Chapter,
   type Content,
   type RelatedResult,
   type TranscriptDetail,
@@ -74,7 +77,6 @@ export function ContentDetailView({
   const [content, setContent] = useState<Content | null>(null)
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
-  const [descOpen, setDescOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -85,21 +87,74 @@ export function ContentDetailView({
   const [pulseMs, setPulseMs] = useState<number | null>(
     startAt !== undefined ? Math.round((startAt + 2) * 1000) : null,
   )
+  const [chapters, setChapters] = useState<Chapter[]>([])
+  const [providerOn, setProviderOn] = useState<boolean | null>(null)
   const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null)
   const lastSaved = useRef(0)
 
   // Stable so the transcript's pulse timer isn't reset on every timeupdate render.
   const clearPulse = useCallback(() => setPulseMs(null), [])
 
-  /** Seek + play, and pulse/scroll the transcript segment at that moment. */
-  function seek(seconds: number) {
+  /** Seek + play only — no tab switch (used by chapter markers). */
+  const playAt = useCallback((seconds: number) => {
     const el = mediaRef.current
     if (el) {
       el.currentTime = seconds
       el.play().catch(() => {})
     }
+  }, [])
+
+  /** Seek + play, and pulse/scroll the transcript segment at that moment. */
+  function seek(seconds: number) {
+    playAt(seconds)
     setTab("transcript")
     setPulseMs(Math.round(seconds * 1000))
+  }
+
+  // Chapters (LLM-generated) + whether an AI provider is configured (empty-state).
+  useEffect(() => {
+    let alive = true
+    setChapters([])
+    backend.getChapters(contentId).then((r) => alive && setChapters(r.chapters)).catch(() => {})
+    backend.intelligence().then((s) => alive && setProviderOn(s.preset !== "none")).catch(() => alive && setProviderOn(false))
+    return () => {
+      alive = false
+    }
+  }, [contentId])
+
+  // Poll while a summary is being generated, then refresh content + chapters.
+  const genStatus = content?.generation_status
+  useEffect(() => {
+    if (genStatus !== "queued" && genStatus !== "running") return
+    const t = setInterval(async () => {
+      try {
+        const c = await backend.libraryItem(contentId)
+        if (!("error" in c && c.error)) {
+          setContent(c as Content)
+          if ((c as Content).generation_status === "done") {
+            backend.getChapters(contentId).then((r) => setChapters(r.chapters)).catch(() => {})
+          }
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 3000)
+    return () => clearInterval(t)
+  }, [genStatus, contentId])
+
+  async function regenerate() {
+    setContent((c) => (c ? { ...c, generation_status: "queued" } : c))
+    try {
+      const r = await backend.generateContent(contentId)
+      if (r.error) {
+        toast.error(r.error)
+        setContent((c) => (c ? { ...c, generation_status: "error" } : c))
+      } else {
+        toast.info("Génération lancée")
+      }
+    } catch {
+      toast.error("Génération impossible")
+    }
   }
 
   // Persist the playback position (throttled) so the Library "Reprendre" block
@@ -280,6 +335,16 @@ export function ContentDetailView({
         />
       )}
 
+      {/* Clickable chapter markers along the timeline. */}
+      {chapters.length > 0 && content.duration_seconds ? (
+        <ChapterBar
+          chapters={chapters}
+          durationSec={content.duration_seconds}
+          currentTime={currentTime}
+          onSeek={playAt}
+        />
+      ) : null}
+
       {/* Header metadata */}
       <div className="flex flex-col gap-2">
         <div className="flex items-start gap-2">
@@ -333,29 +398,29 @@ export function ContentDetailView({
           <TabsTrigger value="transcript">Transcript</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="apercu" className="flex flex-col gap-3">
+        <TabsContent value="apercu" className="flex flex-col gap-4">
+          <SummaryPanel
+            content={content}
+            providerOn={providerOn}
+            onRegenerate={regenerate}
+            onNavigate={onNavigate}
+          />
+
+          {chapters.length > 0 && (
+            <ChaptersList chapters={chapters} currentTime={currentTime} onSeek={playAt} />
+          )}
+
+          {/* Original description, secondary to the summary. */}
           {content.description ? (
-            <div>
-              <p
-                className={
-                  descOpen
-                    ? "whitespace-pre-wrap text-sm text-muted-foreground"
-                    : "line-clamp-4 whitespace-pre-wrap text-sm text-muted-foreground"
-                }
-              >
+            <details className="group">
+              <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+                Description originale
+              </summary>
+              <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">
                 {content.description}
               </p>
-              <button
-                type="button"
-                onClick={() => setDescOpen((o) => !o)}
-                className="mt-1 text-xs font-medium text-primary hover:underline"
-              >
-                {descOpen ? "Réduire" : "Afficher plus"}
-              </button>
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">Aucune description.</p>
-          )}
+            </details>
+          ) : null}
         </TabsContent>
 
         <TabsContent value="transcript">
@@ -748,6 +813,221 @@ function RelatedSection({
           </button>
         ))}
       </div>
+    </div>
+  )
+}
+
+function fmtDate(epochSec: number | null): string {
+  if (!epochSec) return ""
+  try {
+    return new Date(epochSec * 1000).toLocaleDateString("fr-FR", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    })
+  } catch {
+    return ""
+  }
+}
+
+/** Aperçu summary block: short summary in exergue, long below, provenance footer
+ *  + regenerate, with the pedagogical states (no provider / generating / error). */
+function SummaryPanel({
+  content,
+  providerOn,
+  onRegenerate,
+  onNavigate,
+}: {
+  content: Content
+  providerOn: boolean | null
+  onRegenerate: () => void
+  onNavigate: (v: View) => void
+}) {
+  const status = content.generation_status
+  const hasSummary = !!(content.summary_short || content.summary_long)
+
+  if (hasSummary) {
+    const paras = (content.summary_long || "").split(/\n{2,}/).filter((p) => p.trim())
+    return (
+      <div className="flex flex-col gap-3">
+        {content.summary_short && (
+          <p className="text-base font-medium leading-relaxed text-pretty">{content.summary_short}</p>
+        )}
+        {paras.map((p, i) => (
+          <p key={i} className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">
+            {p}
+          </p>
+        ))}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pt-1 text-xs text-muted-foreground">
+          <SparklesIcon className="size-3 text-primary" />
+          <span>
+            Généré{content.summary_model ? ` par ${content.summary_model}` : ""}
+            {content.summary_generated_at ? ` · ${fmtDate(content.summary_generated_at)}` : ""}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-7"
+            onClick={onRegenerate}
+            disabled={status === "queued" || status === "running"}
+          >
+            {status === "queued" || status === "running" ? (
+              <Loader2Icon className="size-3.5 animate-spin" data-icon="inline-start" />
+            ) : (
+              <RotateCcwIcon className="size-3.5" data-icon="inline-start" />
+            )}
+            Régénérer
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  if (status === "queued" || status === "running") {
+    return (
+      <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/30 p-4">
+        <div className="flex items-center gap-2 text-sm text-primary">
+          <Loader2Icon className="size-4 animate-spin" />
+          {status === "queued" ? "En file de génération…" : "Génération du résumé en cours…"}
+        </div>
+        <InlineFeedback state="loading" rows={3} />
+      </div>
+    )
+  }
+
+  if (status === "error") {
+    return (
+      <InlineFeedback
+        state="error"
+        title="Échec de la génération"
+        description="Le résumé n'a pas pu être produit. Vérifiez le fournisseur et réessayez."
+        action={
+          <Button size="sm" variant="outline" onClick={onRegenerate}>
+            <RotateCcwIcon data-icon="inline-start" /> Réessayer
+          </Button>
+        }
+      />
+    )
+  }
+
+  // No summary yet.
+  if (providerOn === false) {
+    return (
+      <InlineFeedback
+        state="empty"
+        icon={SparklesIcon}
+        title="Configurez un fournisseur IA pour obtenir résumés et chapitres"
+        description="Un LLM local (Ollama) ou distant génère un résumé et des chapitres pour chaque contenu transcrit."
+        action={
+          <Button size="sm" onClick={() => onNavigate("settings")}>
+            <SparklesIcon data-icon="inline-start" /> Réglages → Intelligence
+          </Button>
+        }
+      />
+    )
+  }
+
+  return (
+    <InlineFeedback
+      state="empty"
+      icon={WandSparklesIcon}
+      title="Pas encore de résumé"
+      description="Générez un résumé et des chapitres pour ce contenu."
+      action={
+        <Button size="sm" onClick={onRegenerate} disabled={providerOn === null}>
+          <WandSparklesIcon data-icon="inline-start" /> Générer maintenant
+        </Button>
+      }
+    />
+  )
+}
+
+function activeChapterIdx(chapters: Chapter[], currentTime: number): number {
+  const curMs = currentTime * 1000
+  let idx = -1
+  for (let i = 0; i < chapters.length; i++) {
+    if (curMs >= chapters[i].start_ms) idx = i
+    else break
+  }
+  return idx
+}
+
+/** "Chapitres" list — clickable seek, current chapter highlighted during playback
+ *  (same karaoke mechanic as the transcript). */
+function ChaptersList({
+  chapters,
+  currentTime,
+  onSeek,
+}: {
+  chapters: Chapter[]
+  currentTime: number
+  onSeek: (seconds: number) => void
+}) {
+  const active = activeChapterIdx(chapters, currentTime)
+  return (
+    <div className="flex flex-col gap-1.5">
+      <h2 className="text-sm font-semibold">Chapitres</h2>
+      <div className="flex flex-col overflow-hidden rounded-lg border border-border">
+        {chapters.map((c, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => onSeek(c.start_ms / 1000)}
+            className={cn(
+              "flex items-center gap-3 border-b border-border/50 px-3 py-2 text-left text-sm transition-colors last:border-0 hover:bg-muted/50",
+              i === active && "bg-primary/10",
+            )}
+          >
+            <span className="shrink-0 font-mono text-xs tabular-nums text-primary">
+              {fmtMs(c.start_ms)}
+            </span>
+            <span className="text-foreground/90">{c.title}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** Chapter markers along a slim timeline under the player: click to seek, title
+ *  on hover, current chapter and playhead highlighted. */
+function ChapterBar({
+  chapters,
+  durationSec,
+  currentTime,
+  onSeek,
+}: {
+  chapters: Chapter[]
+  durationSec: number
+  currentTime: number
+  onSeek: (seconds: number) => void
+}) {
+  const active = activeChapterIdx(chapters, currentTime)
+  const playhead = Math.max(0, Math.min(100, (currentTime / durationSec) * 100))
+  return (
+    <div className="relative h-6">
+      <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-muted" />
+      <div
+        className="absolute top-1/2 h-1 -translate-y-1/2 rounded-full bg-primary/40"
+        style={{ width: `${playhead}%` }}
+      />
+      {chapters.map((c, i) => {
+        const left = Math.max(0, Math.min(100, ((c.start_ms / 1000) / durationSec) * 100))
+        return (
+          <button
+            key={i}
+            type="button"
+            title={`${fmtMs(c.start_ms)} — ${c.title}`}
+            aria-label={`Chapitre : ${c.title}`}
+            onClick={() => onSeek(c.start_ms / 1000)}
+            style={{ left: `${left}%` }}
+            className={cn(
+              "absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-background transition-transform hover:scale-125",
+              i === active ? "bg-primary" : "bg-primary/60",
+            )}
+          />
+        )
+      })}
     </div>
   )
 }

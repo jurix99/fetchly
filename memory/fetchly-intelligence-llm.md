@@ -1,0 +1,14 @@
+---
+name: fetchly-intelligence-llm
+description: Fetchly's reusable LLM abstraction (llm.py) + generation queue (generate.py) — the "intelligence" foundation future phases build on
+metadata:
+  type: project
+---
+
+Fetchly's first "intelligence" brick — a **reusable LLM infrastructure** later phases (the phase-11 digest, etc.) build on.
+
+- **[app/llm.py](app/llm.py)** — tiny provider abstraction, **stdlib `urllib` only** (no SDK; `requests` is only transitively present via apprise, httpx isn't guaranteed). Two layers: **PROTOCOLS** (`openai_compatible` → `{base}/chat/completions`; `anthropic` → `{base}/v1/messages` with `x-api-key` + `anthropic-version: 2023-06-01`) and a **PRESETS** constant table (`none/anthropic/openai/google_gemini/mistral/groq/openrouter/ollama/lmstudio/custom`) that pre-fills protocol+base_url+suggested model (all editable). `generate(system, prompt, json_schema=None, ...)` returns text or parsed JSON with **tolerant parsing (strip ``` fences) + exactly ONE auto-retry** then clean failure. `test_connection()` for the settings button. `configured()` gates everything — default preset `none` = feature OFF, zero outbound calls. Verified July 2026 model IDs: `claude-haiku-4-5`, `gpt-4o-mini`, `gemini-2.5-flash-lite`, `mistral-small-latest`, groq `openai/gpt-oss-120b` (llama-3.3-70b deprecated).
+- **[app/generate.py](app/generate.py)** — generation queue mirroring [app/transcribe.py](app/transcribe.py) (dedicated single worker, persisted `generation_jobs` table, resumable, dedup). Shares the **night window** via `transcribe._window_open(registry.settings_of("whisper"))`. Produces `summary_short`/`summary_long`/`chapters` via `json_schema`; short transcript (≤~6000 est. tokens) = single pass, long = **map-reduce over `transcript_chunks`** capped at 40 map calls. Chapter `start_ms` is **snapped to the nearest segment start** in `_finalize`. Triggered from `transcribe._run_job` after indexing via `generate.on_transcribed(content_id)` (no-op unless configured).
+- Settings are `store.get_intelligence()` (secret) vs `store.public_intelligence()` (masks api_key → `has_key`); `update_intelligence` treats `api_key` `None`/`"__keep__"` as "keep stored".
+- DB: `contents` gained `summary_short/long/summary_model/summary_generated_at/generation_status` (preserved across re-scan, cascade-deleted); `chapters` table; `generation_jobs` table. Routes: `/api/intelligence[/presets|/test]`, `POST /api/library/{id}/generate`, `POST /api/generate/backfill`, `GET /api/generation-jobs`, `GET /api/library/{id}/chapters`.
+- Frontend: [intelligence-card.tsx](frontend/components/intelligence-card.tsx) (Settings), summary panel + chapters list + `ChapterBar` markers in [content-detail-view.tsx](frontend/components/views/content-detail-view.tsx), `chapter_count`/`summary_short` on library cards. See [[fetchly-frontend-architecture]].

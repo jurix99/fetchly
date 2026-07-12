@@ -106,6 +106,39 @@ def init() -> None:
         _conn.execute("ALTER TABLE contents ADD COLUMN language TEXT")
     except sqlite3.OperationalError:
         pass  # already exists
+    # Intelligence brick: LLM-generated summary + chapters, added post-hoc.
+    for _col, _decl in (
+        ("summary_short", "TEXT"),
+        ("summary_long", "TEXT"),
+        ("summary_model", "TEXT"),
+        ("summary_generated_at", "REAL"),
+        ("generation_status", "TEXT DEFAULT 'none'"),
+    ):
+        try:
+            _conn.execute(f"ALTER TABLE contents ADD COLUMN {_col} {_decl}")
+        except sqlite3.OperationalError:
+            pass  # already exists
+    # Chapters produced alongside the summary (start_ms snapped to a segment).
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chapters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_id TEXT, start_ms INTEGER, title TEXT, ord INTEGER
+        )
+        """
+    )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_chapters_content ON chapters(content_id)")
+    # Dedicated generation queue (separate from downloads and transcription).
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generation_jobs (
+            id TEXT PRIMARY KEY, content_id TEXT, task TEXT, title TEXT,
+            status TEXT, error TEXT, model TEXT, calls INTEGER DEFAULT 0,
+            created_at REAL, started_at REAL, finished_at REAL
+        )
+        """
+    )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_gjobs_status ON generation_jobs(status)")
     # Dedicated transcription queue (separate from the download pool).
     _conn.execute(
         """
@@ -273,7 +306,15 @@ CONTENT_COLUMNS = [
     "channel_url", "duration_seconds", "uploaded_at", "downloaded_at",
     "filepath", "filesize", "thumbnail_path", "watch_id", "kind",
     "transcript_status", "index_status", "language",
+    "summary_short", "summary_long", "summary_model", "summary_generated_at",
+    "generation_status",
 ]
+# Processing fields owned by later phases — a re-download/re-scan must not wipe them.
+_CONTENT_PRESERVE = {
+    "id", "filepath", "transcript_status", "index_status", "language",
+    "summary_short", "summary_long", "summary_model", "summary_generated_at",
+    "generation_status",
+}
 _SORTABLE = {"downloaded_at", "title", "duration_seconds"}
 
 
@@ -286,11 +327,8 @@ def content_upsert(row: dict[str, Any]) -> None:
     placeholders = ", ".join("?" for _ in CONTENT_COLUMNS)
     values = [row.get(c) for c in CONTENT_COLUMNS]
     # Update everything except id + the processing fields (owned by later phases:
-    # a re-download must not wipe a detected language or transcript status).
-    updatable = [
-        c for c in CONTENT_COLUMNS
-        if c not in ("id", "filepath", "transcript_status", "index_status", "language")
-    ]
+    # a re-download must not wipe a detected language, transcript, or summary).
+    updatable = [c for c in CONTENT_COLUMNS if c not in _CONTENT_PRESERVE]
     set_clause = ", ".join(f"{c}=excluded.{c}" for c in updatable)
     with _LOCK:
         _conn.execute(
@@ -354,6 +392,7 @@ def _purge_index_rows(content_id: str) -> None:
     _conn.execute("DELETE FROM transcript_chunks WHERE content_id = ?", (content_id,))
     _conn.execute("DELETE FROM transcript_segments WHERE content_id = ?", (content_id,))
     _conn.execute("DELETE FROM related_cache WHERE content_id = ?", (content_id,))
+    _conn.execute("DELETE FROM chapters WHERE content_id = ?", (content_id,))
 
 
 def content_delete(content_id: str) -> str | None:
@@ -412,6 +451,7 @@ def gc_orphans() -> dict[str, int]:
         r = _conn.execute(
             "DELETE FROM related_cache WHERE content_id NOT IN (SELECT id FROM contents)"
         ).rowcount
+        _conn.execute("DELETE FROM chapters WHERE content_id NOT IN (SELECT id FROM contents)")
         # Vectors whose chunk row is gone (belt and braces around the join above).
         stray = 0
         if VEC_OK:
@@ -496,6 +536,104 @@ def content_set_transcript(content_id: str, status: str, language: str | None = 
                 "UPDATE contents SET transcript_status = ? WHERE id = ?", (status, content_id)
             )
         _conn.commit()
+
+
+# --- Intelligence: summary + chapters --------------------------------------
+def content_set_generation(content_id: str, status: str) -> None:
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute("UPDATE contents SET generation_status = ? WHERE id = ?", (status, content_id))
+        _conn.commit()
+
+
+def content_set_summary(
+    content_id: str, summary_short: str, summary_long: str, model: str, generated_at: float
+) -> None:
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute(
+            "UPDATE contents SET summary_short = ?, summary_long = ?, summary_model = ?, "
+            "summary_generated_at = ?, generation_status = 'done' WHERE id = ?",
+            (summary_short, summary_long, model, generated_at, content_id),
+        )
+        _conn.commit()
+
+
+def chapters_replace(content_id: str, chapters: list[tuple[int, str]]) -> None:
+    """Replace all chapters for a content. `chapters` = [(start_ms, title), …]."""
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute("DELETE FROM chapters WHERE content_id = ?", (content_id,))
+        _conn.executemany(
+            "INSERT INTO chapters (content_id, start_ms, title, ord) VALUES (?, ?, ?, ?)",
+            [(content_id, s, t, i) for i, (s, t) in enumerate(chapters)],
+        )
+        _conn.commit()
+
+
+def chapters_get(content_id: str) -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        "SELECT start_ms, title FROM chapters WHERE content_id = ? ORDER BY ord ASC", (content_id,)
+    )
+    return [{"start_ms": r[0], "title": r[1]} for r in cur.fetchall()]
+
+
+def chapters_count(content_id: str) -> int:
+    conn = _reader()
+    if conn is None:
+        return 0
+    return conn.execute("SELECT COUNT(*) FROM chapters WHERE content_id = ?", (content_id,)).fetchone()[0]
+
+
+def contents_without_summary() -> list[dict[str, Any]]:
+    """Transcribed/indexed contents with no summary yet (for backfill). Only
+    content that HAS a transcript is worth generating for."""
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents "
+        "WHERE transcript_status IN ('done', 'skipped') "
+        "AND (generation_status IS NULL OR generation_status IN ('none', 'error')) "
+        "ORDER BY downloaded_at ASC"
+    )
+    return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+# --- Generation jobs -------------------------------------------------------
+GJOB_COLUMNS = [
+    "id", "content_id", "task", "title", "status", "error", "model",
+    "calls", "created_at", "started_at", "finished_at",
+]
+
+
+def gjob_upsert(row: dict[str, Any]) -> None:
+    if _conn is None:
+        return
+    cols = ", ".join(GJOB_COLUMNS)
+    placeholders = ", ".join("?" for _ in GJOB_COLUMNS)
+    values = [row.get(c) for c in GJOB_COLUMNS]
+    with _LOCK:
+        _conn.execute(
+            f"INSERT OR REPLACE INTO generation_jobs ({cols}) VALUES ({placeholders})", values
+        )
+        _conn.commit()
+
+
+def gjob_all() -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(GJOB_COLUMNS)} FROM generation_jobs ORDER BY created_at ASC"
+    )
+    return [dict(zip(GJOB_COLUMNS, r)) for r in cur.fetchall()]
 
 
 # --- Transcript jobs -------------------------------------------------------

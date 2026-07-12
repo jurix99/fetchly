@@ -57,6 +57,18 @@ DEFAULTS: dict[str, Any] = {
     # it widens a MITM window for the process during the download. Can also be
     # forced with FETCHLY_INSECURE_MODEL_DOWNLOAD=1.
     "insecure_model_download": False,
+    # "Intelligence" — optional LLM provider for summaries + chapters. preset
+    # "none" (default) = feature off, zero outbound LLM calls. See app/llm.py for
+    # the preset table; base_url/model stay editable after a preset is picked.
+    "intelligence": {
+        "preset": "none",           # none | anthropic | openai | google_gemini | mistral | groq | openrouter | ollama | lmstudio | custom
+        "protocol": "openai_compatible",  # openai_compatible | anthropic
+        "base_url": "",
+        "api_key": "",              # secret — masked in API responses
+        "model": "",
+        "style": "concis",          # concis | détaillé
+        "output_language": "auto",  # auto (= content language) | fr | en | …
+    },
 }
 
 # Media keys that are plain on/off toggles.
@@ -89,6 +101,50 @@ def _write(data: dict[str, Any]) -> None:
 def get_config() -> dict[str, Any]:
     with _LOCK:
         return _read()
+
+
+# --- Intelligence (LLM) settings ------------------------------------------
+_INTELLIGENCE_KEYS = ("preset", "protocol", "base_url", "api_key", "model", "style", "output_language")
+
+
+def get_intelligence() -> dict[str, Any]:
+    """Full intelligence config INCLUDING the api_key — for backend use only
+    (llm.py). Never return this straight to the client; use public_intelligence."""
+    cfg = get_config().get("intelligence") or {}
+    defaults = DEFAULTS["intelligence"]
+    return {k: cfg.get(k, defaults[k]) for k in _INTELLIGENCE_KEYS}
+
+
+def public_intelligence() -> dict[str, Any]:
+    """Client-safe view: the api_key is replaced by a boolean `has_key` so the
+    secret never leaves the server."""
+    cfg = get_intelligence()
+    key = cfg.pop("api_key", "")
+    cfg["has_key"] = bool(key)
+    return cfg
+
+
+def update_intelligence(patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge a partial update. An `api_key` of None/"__keep__" preserves the
+    stored one (so the UI can save without re-sending the secret); "" clears it."""
+    with _LOCK:
+        cfg = _read()
+        current = cfg.get("intelligence") or dict(DEFAULTS["intelligence"])
+        for k in _INTELLIGENCE_KEYS:
+            if k not in patch:
+                continue
+            v = patch[k]
+            if k == "api_key":
+                if v is None or v == "__keep__":
+                    continue  # keep existing secret
+                current[k] = str(v)
+            elif k == "style":
+                current[k] = v if v in ("concis", "détaillé") else "concis"
+            else:
+                current[k] = str(v) if v is not None else ""
+        cfg["intelligence"] = current
+        _write(cfg)
+    return public_intelligence()
 
 
 def insecure_model_download() -> bool:

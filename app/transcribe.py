@@ -405,6 +405,13 @@ def _run_job(job: TJob) -> None:
                 indexer.index_content(job.content_id)
             except Exception as exc:  # noqa: BLE001
                 print(f"[transcribe] indexing {job.content_id}: {exc}", flush=True)
+            # Intelligence brick: enqueue summary+chapters generation if a provider
+            # is configured (no-op otherwise). Never fails the transcription.
+            try:
+                from . import generate
+                generate.on_transcribed(job.content_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[transcribe] generation trigger {job.content_id}: {exc}", flush=True)
     except _Canceled:
         job.status = "canceled"
         db.content_set_transcript(job.content_id, "none")

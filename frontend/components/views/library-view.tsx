@@ -290,6 +290,18 @@ function TranscriptDot({ content }: { content: Content }) {
   )
 }
 
+/** Discreet "chaptered" marker shown on cards when a content has chapters. */
+function ChapteredBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
+      title="Chapitres disponibles"
+    >
+      <ListIcon className="size-3" /> chapitré
+    </span>
+  )
+}
+
 function Thumb({ content, className }: { content: Content; className?: string }) {
   return (
     <div className={cn("relative overflow-hidden rounded-md bg-muted", className)}>
@@ -320,9 +332,14 @@ function GridCard({ content, onOpen }: { content: Content; onOpen: (id: string) 
       <Thumb content={content} className="aspect-video w-full" />
       <div className="flex flex-col gap-1 px-1 pb-1">
         <p className="line-clamp-2 text-sm font-medium leading-snug">{content.title}</p>
-        <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
+        {content.summary_short ? (
+          <p className="line-clamp-2 text-xs text-muted-foreground">{content.summary_short}</p>
+        ) : (
+          <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
+        )}
         <div className="mt-0.5 flex items-center gap-2">
           <SourceBadge source={content.source} className="text-[10px]" />
+          {content.chapter_count > 0 && <ChapteredBadge />}
           <span className="text-[11px] text-muted-foreground">{relativeDate(content.downloaded_at)}</span>
           <span className="ml-auto">
             <TranscriptDot content={content} />
@@ -343,8 +360,13 @@ function ListRow({ content, onOpen }: { content: Content; onOpen: (id: string) =
       <Thumb content={content} className="aspect-video w-28 shrink-0" />
       <div className="min-w-0 flex-1">
         <p className="line-clamp-1 text-sm font-medium">{content.title}</p>
-        <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
+        {content.summary_short ? (
+          <p className="line-clamp-1 text-xs text-muted-foreground">{content.summary_short}</p>
+        ) : (
+          <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
+        )}
       </div>
+      {content.chapter_count > 0 && <ChapteredBadge />}
       <SourceBadge source={content.source} className="hidden text-[10px] sm:inline-flex" />
       <span className="hidden w-20 text-right text-[11px] text-muted-foreground sm:block">
         {relativeDate(content.downloaded_at)}

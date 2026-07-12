@@ -198,10 +198,67 @@ export interface Content {
   kind: "video" | "audio"
   transcript_status: TranscriptStatus
   index_status: "none" | "done" | "stale"
+  // intelligence brick (summary + chapters)
+  summary_short: string | null
+  summary_long: string | null
+  summary_model: string | null
+  summary_generated_at: number | null
+  generation_status: GenerationStatus
+  chapter_count: number
   // added by the API serializer
   thumbnail_url: string | null
   stream_url: string
   file_exists: boolean
+}
+
+export type GenerationStatus = "none" | "queued" | "running" | "done" | "error"
+
+/** LLM provider config. `has_key` replaces the secret in responses. */
+export interface IntelligenceSettings {
+  preset: string
+  protocol: "openai_compatible" | "anthropic"
+  base_url: string
+  model: string
+  style: "concis" | "détaillé"
+  output_language: string
+  has_key: boolean
+}
+
+export interface IntelligencePreset {
+  id: string
+  label: string
+  protocol: "openai_compatible" | "anthropic"
+  base_url: string
+  model: string
+  needs_key: boolean
+  key_url: string
+  cost_hint: string
+  install_hint: string
+  local: boolean
+}
+
+export interface TestConnectionResult {
+  ok: boolean
+  message: string
+  model?: string
+  sample?: string
+}
+
+export interface GenerationJob {
+  id: string
+  content_id: string
+  task: string
+  title: string
+  status: "queued" | "running" | "done" | "error" | "canceled"
+  error: string
+  model: string
+  calls: number
+  created_at: number
+}
+
+export interface Chapter {
+  start_ms: number
+  title: string
 }
 
 export interface LibraryPage {
@@ -534,6 +591,33 @@ export const backend = {
   getTranscript: (id: string) => call<TranscriptDetail>("GET", `/api/library/${id}/transcript`),
   backfillTranscripts: (onlyMissing = true) =>
     call<{ queued: number }>("POST", "/api/transcripts/backfill", { only_missing: onlyMissing }),
+  // --- intelligence (LLM summaries + chapters) ---
+  intelligence: () => call<IntelligenceSettings>("GET", "/api/intelligence"),
+  intelligencePresets: () =>
+    call<{ presets: IntelligencePreset[] }>("GET", "/api/intelligence/presets"),
+  saveIntelligence: (
+    b: Partial<{
+      preset: string
+      protocol: string
+      base_url: string
+      api_key: string | null
+      model: string
+      style: string
+      output_language: string
+    }>,
+  ) => call<IntelligenceSettings>("POST", "/api/intelligence", b),
+  testIntelligence: () => call<TestConnectionResult>("POST", "/api/intelligence/test"),
+  generateContent: (id: string) =>
+    call<{ job_id?: string; status?: string; error?: string }>("POST", `/api/library/${id}/generate`),
+  generateBackfill: (onlyMissing = true) =>
+    call<{ queued?: number; error?: string }>("POST", "/api/generate/backfill", {
+      only_missing: onlyMissing,
+    }),
+  generationJobs: () => call<GenerationJob[]>("GET", "/api/generation-jobs"),
+  cancelGenerationJob: (id: string) =>
+    call<{ status: string }>("POST", `/api/generation-jobs/${id}/cancel`),
+  getChapters: (id: string) =>
+    call<{ content_id: string; chapters: Chapter[] }>("GET", `/api/library/${id}/chapters`),
   // --- search & index ---
   searchLibrary: (
     q: string,

@@ -5,6 +5,74 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.6] - 2026-07-12
+
+First **intelligence** brick — every transcribed content can get an LLM-generated
+**summary and chapters**, from a **local** model (Ollama, LM Studio) or a **remote**
+one (an API key). Optional, asynchronous, and replayable: with no provider
+configured Fetchly works exactly as before and makes zero outbound LLM calls.
+Built as reusable infrastructure the future digest and later phases sit on.
+
+### Added
+
+- **LLM provider abstraction** (`app/llm.py`) — deliberately tiny, one file, no
+  SDK (stdlib `urllib` only). Two protocols cover the whole market:
+  **openai_compatible** (`/chat/completions` — OpenAI, Gemini's OpenAI endpoint,
+  Mistral, Groq, OpenRouter, Ollama, LM Studio, vLLM…) and **anthropic**
+  (`/v1/messages`). A single editable **presets table** pre-fills protocol +
+  base URL + a suggested model per provider; `generate(system, prompt,
+  json_schema=…)` returns text or parsed JSON with tolerant parsing (strips
+  code fences) and **one** automatic retry on invalid JSON, then a clean failure
+  — never a retry loop. `test_connection()` powers the settings button.
+- **Generation queue** (`app/generate.py`) — a dedicated single-worker FIFO queue
+  (same shape as the transcription queue): persisted, resumable across restarts,
+  honouring the **shared night window** ("deferred processing"). One pass per
+  content produces `summary_short` (2–3 sentences), `summary_long` (3–6
+  paragraphs) and 3–12 **chapters**. Short transcripts summarise in a single
+  pass; long ones use **map-reduce over the ~45 s semantic chunks** (bounded map
+  calls, with a note in the long summary when truncated). Each chapter's
+  timestamp is **snapped to the nearest real segment start**, so player markers
+  always land on a spoken boundary. Guardrails: per-call timeout, capped calls
+  per content, call count logged per job.
+- **Automatic + manual triggering** — a successful transcription (and `skipped`
+  content that has source subtitles) enqueues generation **only if a provider is
+  configured**. `POST /api/library/{id}/generate` forces a regeneration
+  (overwrites), `POST /api/generate/backfill { only_missing }` runs the whole
+  library as a visible job, and jobs are cancelable
+  (`GET /api/generation-jobs`, `POST /api/generation-jobs/{id}/cancel`).
+- **Settings → Intelligence** — a provider picker (Anthropic, OpenAI, Google
+  Gemini, Mistral, Groq, OpenRouter, Ollama, LM Studio, Personnalisé) that
+  pre-fills the fields and shows contextual help: where to get the key (provider
+  console link), a rough cost hint ("~0,1–0,5 centime par vidéo résumée avec un
+  modèle léger"), and the model-install command for Ollama/LM Studio. A visible
+  note on cloud presets — *« Les transcripts partent chez le fournisseur choisi
+  pour être résumés — préférez Ollama pour un traitement 100 % local. »* — plus a
+  **Tester la connexion** button (three inline states) and **Générer pour toute
+  la bibliothèque** behind a confirm dialog. The API key is stored locally and
+  **never returned** by the API (responses expose only `has_key`).
+- **Content page — enriched Aperçu** — `summary_short` in the lede, `summary_long`
+  below, a discreet *"Généré par {modèle} · {date}"* footer and a **Régénérer**
+  button. Pedagogical states: no provider → an Empty pointing to the settings;
+  queued/running → skeleton + status (auto-refreshes); error → message + retry.
+- **Chapters in the player** — clickable markers along a slim timeline under the
+  player (title on hover) and a **Chapitres** list that seeks, with the current
+  chapter highlighted during playback (same mechanic as the transcript karaoke).
+- **Library cards** — `summary_short` on one or two lines under the title (in
+  place of the raw description) and a discreet **« chapitré »** badge when a
+  content has chapters.
+
+### Notes
+
+- **Deferred processing is shared** with transcription: if you enabled the
+  nightly window for Whisper, summaries generate in that same window.
+- Nothing runs without an explicit provider — no default key, no auto-generation,
+  no outbound LLM call. Cloud providers receive the transcript text to summarise;
+  choose Ollama or LM Studio for a fully local pipeline.
+- Suggested model IDs are just editable defaults (verified July 2026):
+  `claude-haiku-4-5`, `gpt-4o-mini`, `gemini-2.5-flash-lite`,
+  `mistral-small-latest`, Groq `openai/gpt-oss-120b`. base_url and model stay
+  editable after picking a preset.
+
 ## [0.0.5] - 2026-07-12
 
 Phase 3 (opening) — Fetchly's north-star made real: **find a phrase you heard in

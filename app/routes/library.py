@@ -50,6 +50,12 @@ async def get_content(content_id: str) -> JSONResponse:
     return JSONResponse(library.to_public(row))
 
 
+@router.get("/api/library/{content_id}/chapters")
+async def get_chapters(content_id: str) -> JSONResponse:
+    """LLM-generated chapters (start_ms snapped to a segment) for the player."""
+    return JSONResponse({"content_id": content_id, "chapters": db.chapters_get(content_id)})
+
+
 @router.get("/api/library/{content_id}/related")
 async def related_content(content_id: str, limit: int = 5) -> JSONResponse:
     """Contents in the user's own library close to this one (the first crossing of
