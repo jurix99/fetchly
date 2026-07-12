@@ -52,6 +52,11 @@ for module in (
 @app.on_event("startup")
 def _on_startup() -> None:
     db.init()
+    # Sweep index rows orphaned by crashes or off-band file removal (keepLastN),
+    # so the KNN isn't polluted by vectors pointing at gone contents.
+    gc = db.gc_orphans()
+    if any(gc.values()):
+        print(f"[startup] gc: {gc}", flush=True)
     # Load builtin + user plugins (failures are isolated, never block boot).
     registry.discover()
     # Rebuild the job cache and re-queue anything a restart interrupted. Only run

@@ -148,3 +148,28 @@
     @apply font-sans;
   }
 }
+
+/* Jump-to-second: a 2 s warning-wash pulse on the transcript segment the search
+   landed on — same warning token as a match highlight, so the visual language is
+   consistent everywhere a moment is surfaced. */
+@keyframes fetchly-seek-pulse {
+  0%,
+  100% {
+    background-color: transparent;
+  }
+  15%,
+  55% {
+    background-color: color-mix(in oklab, var(--warning) 45%, transparent);
+  }
+}
+
+.animate-seek-pulse {
+  animation: fetchly-seek-pulse 2s ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-seek-pulse {
+    animation-duration: 0.01ms;
+    background-color: color-mix(in oklab, var(--warning) 30%, transparent);
+  }
+}

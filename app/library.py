@@ -24,6 +24,34 @@ _ID_RE = re.compile(r"\[([A-Za-z0-9_-]{6,})\]\s*$")
 _AUDIO_EXTS = {"mp3", "m4a", "opus", "flac", "wav", "aac", "ogg"}
 THUMBS_DIR = DOWNLOAD_DIR / ".fetchly" / "thumbs"
 _HIDDEN = ".fetchly"
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+# --- Pure helpers (unit-tested; kept free of FastAPI) ----------------------
+def is_within(path: Path | str, root: Path | str) -> bool:
+    """True iff `path` resolves inside `root` — the path-traversal guard shared by
+    streaming and deletion. Never raises."""
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def parse_byte_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+    """Parse an HTTP Range header into a clamped (start, end) inclusive pair, or
+    None when there's no//invalid range (caller then serves the whole file).
+    Clamps into [0, file_size-1] so a malformed or over-long range is safe."""
+    if not range_header or file_size <= 0:
+        return None
+    m = _RANGE_RE.match(range_header)
+    if not m:
+        return None
+    start = int(m.group(1)) if m.group(1) else 0
+    end = int(m.group(2)) if m.group(2) else file_size - 1
+    end = min(end, file_size - 1)
+    start = max(0, min(start, end))
+    return start, end
 
 
 def _kind_for(path: Path) -> str:
@@ -257,9 +285,7 @@ def resolve_media(content_id: str) -> Path | None:
     row = db.content_get(content_id)
     if not row or not row.get("filepath"):
         return None
-    try:
-        path = Path(row["filepath"]).resolve()
-        path.relative_to(DOWNLOAD_DIR.resolve())  # raises if outside
-    except (ValueError, OSError):
+    if not is_within(row["filepath"], DOWNLOAD_DIR):  # path-traversal guard
         return None
+    path = Path(row["filepath"]).resolve()
     return path if path.is_file() else None

@@ -17,7 +17,7 @@ import os
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -119,14 +119,26 @@ def device_label() -> str:
     return "GPU (CUDA)" if _cuda_available() else "CPU (int8)"
 
 
+def _model_download_ctx():
+    """Context manager wrapping a model download. Relaxes TLS **only** when the
+    user has explicitly opted in (``insecure_model_download`` / env), otherwise a
+    no-op that keeps full certificate verification. Default is verification ON."""
+    from . import store
+    if store.insecure_model_download():
+        return _relaxed_tls()
+    return nullcontext()
+
+
 @contextmanager
 def _relaxed_tls():
     """Temporarily relax TLS verification for a model download behind a
-    TLS-intercepting corporate proxy (mirrors yt-dlp's `nocheckcertificate`;
-    only safe on a trusted network). huggingface_hub 1.x uses httpx, which builds
-    its SSL context from ssl.create_default_context — we relax that for the
-    duration of the download only, then restore it, so nothing else is affected
-    long-term. Used only when a model actually needs downloading."""
+    TLS-intercepting corporate proxy (mirrors yt-dlp's `nocheckcertificate`).
+
+    OPT-IN only (see ``_model_download_ctx``). CAVEAT: huggingface_hub builds its
+    SSL context from ssl.create_default_context, so the relaxation is **process
+    wide** for the (multi-minute) duration of the download — any other outbound
+    request in that window (e.g. Apprise, Jellyfin) is also unverified. Only
+    enable on a trusted, TLS-intercepting network. Restored on exit."""
     import ssl
     orig_ctx = ssl.create_default_context
     orig_https = getattr(ssl, "_create_default_https_context", None)
@@ -165,7 +177,7 @@ def _build_model(name: str, device: str, ctype: str):
     from faster_whisper import WhisperModel
     if _model_cached(name):
         return WhisperModel(name, device=device, compute_type=ctype, download_root=str(MODELS_DIR))
-    with _relaxed_tls():
+    with _model_download_ctx():
         return WhisperModel(name, device=device, compute_type=ctype, download_root=str(MODELS_DIR))
 
 

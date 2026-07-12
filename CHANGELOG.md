@@ -5,6 +5,70 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.5] - 2026-07-12
+
+Phase 3 (opening) — Fetchly's north-star made real: **find a phrase you heard in
+5 seconds, from anywhere.** Global search becomes omnipresent (Cmd/Ctrl+K), drops
+you on the exact second, and the Library steps up as the app's home. The first
+crossing of the memory appears — contents that echo one another.
+
+### Added
+
+- **Omnipresent search (Cmd/Ctrl+K)** — a command palette reachable from every
+  view: live results (250 ms debounce, stale requests cancelled), full keyboard
+  control (↑/↓, Enter to open, Esc to close and restore focus), each result
+  showing thumbnail, title, channel and its best timestamped passage. Enter opens
+  the content at the exact second (2 s recall for context). The top-bar carries a
+  persistent search field with the shortcut shown in a `kbd`; the palette (and the
+  whole search stack) is **lazy-loaded** so the top-bar stays light.
+- **Full results page** (`/?q=…`) for exploration beyond the palette: header with
+  the query, result count and response time ("23 résultats · 41 ms" — speed is a
+  product argument, so it's shown), one card per content with up to 3 passages
+  (clickable `m:ss` + snippet with matched terms highlighted from API offsets), a
+  discreet **« correspondance de sens »** badge on semantic matches (tooltip:
+  found by similarity, not exact words), a foldable "voir les N autres passages"
+  per content, and light side filters (source, channel, period, duration).
+  Pedagogical states for zero results and a partial/empty index, with the real
+  numbers (indexed / total) and a CTA toward transcription.
+- **Perfect jump-to-second** — opening a result seeks the player to start − 2 s,
+  plays, switches to the Transcript, scrolls to the matching segment and pulses it
+  for 2 s — the same highlight language as in-transcript search.
+- **Library as home** — `/` opens the **Bibliothèque** when it holds at least one
+  content (else the onboarding Home, still reachable). Composable header sections:
+  **Reprendre** (the 3 last-played contents, resumed at the remembered position)
+  and **Ajouts récents** (last 7 days) — structured so a future "Digest" slots in
+  above without a rewrite.
+- **Related contents** — on a content page, a **« Dans votre bibliothèque »**
+  section lists 3–5 close contents (compact card + discreet proximity score); for
+  the closest, the best **"this moment ↔ that moment"** passage pair, each
+  timestamp clickable (one seeks the current player, the other opens the target at
+  its second). Hidden when there are fewer than 2 indexed contents or nothing above
+  the similarity floor — never a disappointing empty section.
+  `GET /api/library/{id}/related` (mean of the top-3 chunk-pair cosine
+  similarities, same-`source_id` dedup, cached per content and invalidated when
+  either side is re-indexed).
+- **North-star instrumentation (local only)** — a `search_events` table records
+  each search and whether it led to opening a passage; Settings shows a
+  **« Votre mémoire travaille : N retrouvailles cette semaine »** card. No outbound
+  telemetry — usage metrics never leave your own database.
+  `POST /api/search/feedback`, `GET /api/search/metrics`.
+
+### Changed
+
+- **`GET /api/search`** gains passage pagination per content (`passage_limit` +
+  `passage_total`), facet filters (`source`, `channel`, `period`, `min/max_duration`)
+  and explicit **highlight offsets**, and returns index-coverage context
+  (`indexed` / `total` / `semantic`) so the UI can render the pedagogical states in
+  a single round-trip.
+
+### Notes
+
+- "Reprendre" positions are stored client-side (localStorage) — no schema change,
+  no server round-trip.
+- Related-content similarity **reuses the stored embeddings** (no re-embedding) and
+  the sqlite-vec KNN index, so it stays cheap; results are cached per content and
+  keyed on a global index version bumped on every (re)index.
+
 ## [0.0.4] - 2026-07-12
 
 Phase 2 — Fetchly stops being just a downloader and becomes a searchable media

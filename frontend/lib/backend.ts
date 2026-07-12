@@ -277,6 +277,8 @@ export interface IndexStats {
 export interface SearchPassage {
   start_ms: number
   text: string
+  /** Char offsets [start, end) of highlighted spans within `text` (lexical only). */
+  highlights?: [number, number][]
   match_type: "lexical" | "semantic"
   score: number
 }
@@ -290,13 +292,59 @@ export interface LibrarySearchResult {
   thumbnail_url: string | null
   score: number
   passages: SearchPassage[]
+  passage_total?: number
 }
 
 export interface LibrarySearchResponse {
   query: string
+  query_hash: string
   took_ms: number
   count: number
+  /** Index coverage context for pedagogical empty/partial states. */
+  indexed: number
+  total: number
+  semantic: boolean
   results: LibrarySearchResult[]
+}
+
+/** Optional facet filters for the full results page (durations in SECONDS). */
+export interface SearchFilters {
+  source?: string
+  channel?: string
+  period?: "week" | "month" | "quarter" | "year"
+  min_duration?: number
+  max_duration?: number
+  passage_limit?: number
+}
+
+/** One content close to the current one (shared "Dans votre bibliothèque"). */
+export interface RelatedResult {
+  id: string
+  title: string
+  channel: string
+  source: string
+  duration_seconds: number | null
+  thumbnail_url: string | null
+  score: number
+  pair?: {
+    a_start_ms: number
+    a_text: string
+    b_start_ms: number
+    b_text: string
+    score: number
+  }
+}
+
+export interface RelatedResponse {
+  content_id: string
+  results: RelatedResult[]
+}
+
+export interface SearchMetrics {
+  retrievals_week: number
+  searches_week: number
+  retrievals_total: number
+  window_days: number
 }
 
 export interface BackendCookies {
@@ -364,6 +412,23 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     method,
     headers: { "Content-Type": "application/json" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  return res.json().catch(() => ({})) as Promise<T>
+}
+
+/** Like `call` but abortable — used to cancel stale live-search requests. The
+ *  AbortError propagates so callers can ignore superseded responses. */
+async function callSignal<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   })
   return res.json().catch(() => ({})) as Promise<T>
 }
@@ -470,10 +535,27 @@ export const backend = {
   backfillTranscripts: (onlyMissing = true) =>
     call<{ queued: number }>("POST", "/api/transcripts/backfill", { only_missing: onlyMissing }),
   // --- search & index ---
-  searchLibrary: (q: string, scope = "all", limit = 20) => {
+  searchLibrary: (
+    q: string,
+    scope = "all",
+    limit = 20,
+    filters?: SearchFilters,
+    signal?: AbortSignal,
+  ) => {
     const qs = new URLSearchParams({ q, scope, limit: String(limit) })
-    return call<LibrarySearchResponse>("GET", `/api/search?${qs}`)
+    if (filters) {
+      for (const [k, v] of Object.entries(filters)) {
+        if (v !== undefined && v !== null && v !== "") qs.set(k, String(v))
+      }
+    }
+    return callSignal<LibrarySearchResponse>("GET", `/api/search?${qs}`, undefined, signal)
   },
+  /** LOCAL north-star: mark that a search led to opening a result. */
+  searchFeedback: (query_hash: string, clicked = true) =>
+    call<{ ok: boolean }>("POST", "/api/search/feedback", { query_hash, clicked }),
+  searchMetrics: () => call<SearchMetrics>("GET", "/api/search/metrics"),
+  related: (id: string, limit = 5) =>
+    call<RelatedResponse>("GET", `/api/library/${id}/related?limit=${limit}`),
   indexStats: () => call<IndexStats>("GET", "/api/index/stats"),
   indexBackfill: () => call<{ job_id: string }>("POST", "/api/index/backfill"),
   indexRebuild: () => call<{ job_id: string }>("POST", "/api/index/rebuild"),

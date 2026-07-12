@@ -8,6 +8,9 @@ source subtitles imported), so it never blocks a download or the pipeline.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import threading
 import time
@@ -16,13 +19,33 @@ from typing import Any
 
 from . import db, store
 
-# Multilingual 384-dim embedder that fastembed ships as ONNX (no torch — the
-# actual constraint). intfloat/multilingual-e5-small isn't in the pinned
-# fastembed's registry; this MiniLM is 384-dim, multilingual and strong in
-# French. Swap here (and drop the prefixes below) if a fastembed build bundling
-# e5-small is pinned.
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-MODEL_LANG = "multilingue (50+ langues, fort en français)"
+# FTS snippet() wraps matched terms with these control chars (STX/ETX) — see
+# db.fts_segments. We parse them into explicit character offsets for the UI.
+_HL_OPEN = "\x02"
+_HL_CLOSE = "\x03"
+
+# "période" presets → lookback window in days (None = all time).
+_PERIOD_DAYS = {"week": 7, "month": 30, "quarter": 90, "year": 365}
+
+# Related-contents tuning.
+_REL_KNN = 25           # neighbours fetched per source chunk
+_REL_TOP_PAIRS = 3      # average of the N best chunk-pair similarities per candidate
+_REL_MIN_SCORE = 0.55   # cosine-similarity floor below which a link isn't shown
+
+# Preferred 384-dim ONNX embedders (no torch — the actual constraint), best
+# first. intfloat/multilingual-e5-small is markedly stronger for French
+# retrieval but only ships in newer fastembed registries; MiniLM is the
+# always-available fallback. Both are 384-dim, so the vec table (float[384]) is
+# unchanged — switching models just needs an index rebuild (UI button exists).
+# e5 is asymmetric: it needs "query: " / "passage: " prefixes (MiniLM doesn't).
+# Override the choice with FETCHLY_EMBED_MODEL=<fastembed model id>.
+_PREFERRED_MODELS: list[tuple[str, str]] = [
+    ("intfloat/multilingual-e5-small", "e5 multilingue (fort en retrieval FR)"),
+    ("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "MiniLM multilingue (50+ langues)"),
+]
+MODEL_NAME = _PREFERRED_MODELS[0][0]  # updated once the real model is loaded
+MODEL_LANG = _PREFERRED_MODELS[0][1]
+_USE_PREFIX = True  # e5-style query/passage prefixes; finalised on load
 MODELS_DIR = store.CONFIG_DIR / "models"
 _RRF_K = 60
 _CHUNK_MS = 45_000
@@ -33,16 +56,41 @@ _model_lock = threading.Lock()
 
 
 # --- embeddings ------------------------------------------------------------
+def _set_selected(name: str, lang: str) -> None:
+    global MODEL_NAME, MODEL_LANG, _USE_PREFIX
+    MODEL_NAME, MODEL_LANG = name, lang
+    _USE_PREFIX = "e5" in name.lower()  # e5 family needs query/passage prefixes
+
+
 def _get_model():
+    """Load the best available embedder, falling back down the preferred list if
+    a model isn't in the installed fastembed registry (so a fastembed bump to one
+    that bundles e5 upgrades retrieval quality automatically)."""
     global _model
     with _model_lock:
-        if _model is None:
-            from fastembed import TextEmbedding
-            from . import transcribe
-            # Relax TLS only for the (first-use) model download, like Whisper.
-            with transcribe._relaxed_tls():
-                _model = TextEmbedding(model_name=MODEL_NAME, cache_dir=str(MODELS_DIR))
-        return _model
+        if _model is not None:
+            return _model
+        from fastembed import TextEmbedding
+        from . import transcribe
+
+        override = os.environ.get("FETCHLY_EMBED_MODEL", "").strip()
+        candidates = (
+            [(override, "modèle personnalisé (env)")] if override else list(_PREFERRED_MODELS)
+        )
+        # TLS relaxation is opt-in (default off), like Whisper.
+        with transcribe._model_download_ctx():
+            last_exc: Exception | None = None
+            for name, lang in candidates:
+                try:
+                    m = TextEmbedding(model_name=name, cache_dir=str(MODELS_DIR))
+                    _set_selected(name, lang)
+                    _model = m
+                    print(f"[indexer] embedding model: {name}", flush=True)
+                    return _model
+                except Exception as exc:  # noqa: BLE001 — try the next candidate
+                    last_exc = exc
+                    print(f"[indexer] embedding model {name} unavailable ({exc}); trying next", flush=True)
+        raise last_exc if last_exc else RuntimeError("no embedding model available")
 
 
 def _serialize(vec) -> bytes:
@@ -55,9 +103,18 @@ def _embed(texts: list[str]) -> list[Any]:
     return list(model.embed(texts, batch_size=32))
 
 
+def _embed_passages(texts: list[str]) -> list[Any]:
+    """Embed chunk texts for indexing (e5 needs a 'passage: ' prefix)."""
+    _get_model()  # ensure _USE_PREFIX is finalised
+    if _USE_PREFIX:
+        texts = [f"passage: {t}" for t in texts]
+    return _embed(texts)
+
+
 def embed_query(q: str) -> bytes:
-    # MiniLM uses symmetric embeddings (no query/passage prefix).
-    return _serialize(_embed([q])[0])
+    _get_model()  # ensure _USE_PREFIX is finalised
+    text = f"query: {q}" if _USE_PREFIX else q
+    return _serialize(_embed([text])[0])
 
 
 # --- chunking --------------------------------------------------------------
@@ -123,7 +180,7 @@ def index_content(content_id: str) -> None:
         chunks = build_chunks(segments)
         ids = db.chunks_insert(content_id, chunks)
         if db.VEC_OK and chunks:
-            embs = _embed([c[2] for c in chunks])
+            embs = _embed_passages([c[2] for c in chunks])
             db.vec_insert([(ids[k], _serialize(embs[k])) for k in range(len(ids))])
         db.content_set_index(content_id, "done")
     except Exception:  # noqa: BLE001
@@ -146,18 +203,164 @@ def _content_card(content_id: str) -> dict[str, Any] | None:
     }
 
 
+# --- related contents (cross-memory) ---------------------------------------
+def related(content_id: str, limit: int = 5) -> dict[str, Any]:
+    """Contents semantically close to this one. Similarity between two contents =
+    mean of the top-`_REL_TOP_PAIRS` cosine similarities between their chunks. We
+    reuse stored embeddings (no re-embed) and the sqlite-vec KNN index, so this is
+    cheap. Excludes self and same-source duplicates, applies a score floor, and
+    returns the single best passage pair per link. Cached per content, keyed on
+    the global index version (invalidated on any (re)index)."""
+    version = db.index_version()
+    cached = db.related_cache_get(content_id, version)
+    if cached is not None:
+        try:
+            return json.loads(cached)
+        except (TypeError, json.JSONDecodeError):
+            pass
+
+    empty = {"content_id": content_id, "results": []}
+    if not db.VEC_OK:
+        return empty
+    base = db.content_get(content_id)
+    if not base:
+        return empty
+    chunks = db.chunks_of(content_id)
+    if len(chunks) == 0:
+        db.related_cache_set(content_id, version, json.dumps(empty))
+        return empty
+
+    base_source_id = base.get("source_id") or ""
+    # candidate content_id -> {sims: [...], best: (sim, a_chunk, b_hit)}
+    agg: dict[str, dict[str, Any]] = {}
+    for ch in chunks:
+        blob = db.vec_get(ch["id"])
+        if not blob:
+            continue
+        for hit in db.vec_knn(blob, _REL_KNN):
+            cid = hit["content_id"]
+            if cid == content_id:
+                continue
+            sim = 1.0 - float(hit["distance"])  # cosine distance -> similarity
+            slot = agg.setdefault(cid, {"sims": [], "best": None})
+            slot["sims"].append(sim)
+            if slot["best"] is None or sim > slot["best"][0]:
+                slot["best"] = (sim, ch, hit)
+
+    scored: list[tuple[float, str, dict[str, Any]]] = []
+    for cid, slot in agg.items():
+        cand = db.content_get(cid)
+        if not cand:
+            continue
+        # Drop same-source duplicates (re-uploads / mirrors of the same item).
+        if base_source_id and (cand.get("source_id") or "") == base_source_id:
+            continue
+        top = sorted(slot["sims"], reverse=True)[:_REL_TOP_PAIRS]
+        mean = sum(top) / len(top)
+        if mean < _REL_MIN_SCORE:
+            continue
+        scored.append((mean, cid, slot["best"]))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = []
+    for mean, cid, best in scored[:limit]:
+        card = _content_card(cid)
+        if not card:
+            continue
+        item = {**card, "score": round(mean, 4)}
+        if best is not None:
+            _sim, a_chunk, b_hit = best
+            item["pair"] = {
+                "a_start_ms": a_chunk["start_ms"], "a_text": a_chunk["text"],
+                "b_start_ms": b_hit["start_ms"], "b_text": b_hit["text"],
+                "score": round(best[0], 4),
+            }
+        results.append(item)
+
+    payload = {"content_id": content_id, "results": results}
+    db.related_cache_set(content_id, version, json.dumps(payload))
+    return payload
+
+
 # --- search (hybrid, RRF) --------------------------------------------------
-def search(q: str, scope: str = "all", limit: int = 20) -> dict[str, Any]:
+def query_hash(q: str) -> str:
+    """Stable, privacy-preserving id of a query for LOCAL instrumentation."""
+    norm = " ".join(re.findall(r"\w+", q.lower()))
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_highlights(snippet: str) -> tuple[str, list[list[int]]]:
+    """Turn an FTS snippet with STX/ETX markers into clean text + char offsets
+    [[start, end], …] of the highlighted spans (offsets into the clean text)."""
+    if _HL_OPEN not in snippet:
+        return snippet, []
+    out: list[str] = []
+    spans: list[list[int]] = []
+    pos = 0
+    start = -1
+    for ch in snippet:
+        if ch == _HL_OPEN:
+            start = pos
+        elif ch == _HL_CLOSE:
+            if start >= 0:
+                spans.append([start, pos])
+                start = -1
+        else:
+            out.append(ch)
+            pos += 1
+    return "".join(out), spans
+
+
+def _passes_filters(card: dict[str, Any], row: dict[str, Any], f: dict[str, Any]) -> bool:
+    if f.get("source") and (row.get("source") or "") != f["source"]:
+        return False
+    if f.get("channel") and (row.get("channel") or "") != f["channel"]:
+        return False
+    dur = row.get("duration_seconds") or 0
+    if f.get("min_duration") is not None and dur < f["min_duration"]:
+        return False
+    if f.get("max_duration") is not None and dur > f["max_duration"]:
+        return False
+    since = f.get("since_ts")
+    if since is not None:
+        dl = row.get("downloaded_at") or 0
+        if dl < since:
+            return False
+    return True
+
+
+def search(
+    q: str,
+    scope: str = "all",
+    limit: int = 20,
+    *,
+    passage_limit: int = 3,
+    source: str | None = None,
+    channel: str | None = None,
+    period: str | None = None,
+    min_duration: int | None = None,
+    max_duration: int | None = None,
+    record: bool = True,
+) -> dict[str, Any]:
     t0 = time.monotonic()
     content_id = None if scope in (None, "", "all") else scope
     tokens = re.findall(r"\w+", q.lower())
+    filters = {
+        "source": source or None,
+        "channel": channel or None,
+        "min_duration": min_duration,
+        "max_duration": max_duration,
+        "since_ts": (time.time() - _PERIOD_DAYS[period] * 86400) if period in _PERIOD_DAYS else None,
+    }
+    # Fetch enough hits to fill per-content passage lists after grouping.
+    fetch = max(limit, passage_limit) * 4
 
-    seg_hits = db.fts_segments(tokens, limit * 3, content_id)
-    con_hits = db.fts_contents(tokens, limit * 3, content_id)
+    seg_hits = db.fts_segments(tokens, fetch, content_id)
+    con_hits = db.fts_contents(tokens, fetch, content_id)
     sem_hits: list[dict[str, Any]] = []
     if db.VEC_OK and q.strip():
         try:
-            knn = db.vec_knn(embed_query(q), limit * 3)
+            knn = db.vec_knn(embed_query(q), fetch)
             sem_hits = [h for h in knn if not content_id or h["content_id"] == content_id]
         except Exception as exc:  # noqa: BLE001 — semantic branch never breaks search
             print(f"[indexer] semantic search failed: {exc}", flush=True)
@@ -173,31 +376,73 @@ def search(q: str, scope: str = "all", limit: int = 20) -> dict[str, Any]:
 
     for rank, h in enumerate(seg_hits):
         s = add(h["content_id"], rank)
+        text, highlights = _parse_highlights(h["snippet"])
         passages.setdefault(h["content_id"], []).append({
-            "start_ms": h["start_ms"], "text": h["snippet"], "match_type": "lexical", "score": s,
+            "start_ms": h["start_ms"], "text": text, "highlights": highlights,
+            "match_type": "lexical", "score": s,
         })
     for rank, h in enumerate(sem_hits):
         s = add(h["content_id"], rank)
         passages.setdefault(h["content_id"], []).append({
-            "start_ms": h["start_ms"], "text": h["text"], "match_type": "semantic", "score": s,
+            "start_ms": h["start_ms"], "text": h["text"], "highlights": [],
+            "match_type": "semantic", "score": s,
         })
     for rank, h in enumerate(con_hits):
         add(h["content_id"], rank)  # metadata boost, no timestamped passage
 
     results = []
-    for cid in sorted(scores, key=lambda c: scores[c], reverse=True)[:limit]:
+    for cid in sorted(scores, key=lambda c: scores[c], reverse=True):
+        row = db.content_get(cid)
         card = _content_card(cid)
-        if not card:
+        if not row or not card:
             continue
-        ps = sorted(passages.get(cid, []), key=lambda p: p["score"], reverse=True)[:3]
-        results.append({**card, "score": round(scores[cid], 5), "passages": ps})
+        if not _passes_filters(card, row, filters):
+            continue
+        all_ps = _dedupe_passages(passages.get(cid, []))
+        results.append({
+            **card,
+            "score": round(scores[cid], 5),
+            "passages": all_ps[:passage_limit],
+            "passage_total": len(all_ps),
+        })
+        if len(results) >= limit:
+            break
+
+    idx = db.index_stats()
+    qh = query_hash(q)
+    # Only top-level (whole-library) searches count as a "search"; scoped calls
+    # (passage pagination within one content) are refinements, not new searches.
+    if record and q.strip() and content_id is None:
+        db.search_event_insert(qh, len(results))
 
     return {
         "query": q,
+        "query_hash": qh,
         "took_ms": round((time.monotonic() - t0) * 1000, 1),
         "count": len(results),
+        "indexed": idx.get("indexed", 0),
+        "total": idx.get("total", 0),
+        "semantic": db.VEC_OK,
         "results": results,
     }
+
+
+def _dedupe_passages(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse passages that point at (nearly) the same moment, preferring the
+    lexical one (it carries highlight offsets). Sorted best-score first."""
+    best: dict[int, dict[str, Any]] = {}
+    for p in ps:
+        key = int(p["start_ms"] / 1000)  # 1 s bucket
+        cur = best.get(key)
+        if cur is None:
+            best[key] = p
+            continue
+        # Prefer lexical (highlights) then higher score.
+        cur_lex = cur["match_type"] == "lexical"
+        p_lex = p["match_type"] == "lexical"
+        if (p_lex and not cur_lex) or (p_lex == cur_lex and p["score"] > cur["score"]):
+            best[key] = p
+    return sorted(best.values(), key=lambda p: p["score"], reverse=True)
 
 
 # --- backfill / rebuild / stats -------------------------------------------

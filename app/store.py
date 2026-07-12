@@ -51,6 +51,12 @@ DEFAULTS: dict[str, Any] = {
     "download_archive": False,      # manual downloads skip already-downloaded
     "min_free_gb": 2,               # refuse to start a download below this free space
     "nfo_export": False,            # write Jellyfin/Plex .nfo + poster sidecars
+    # OPT-IN, default OFF. When true, TLS verification is relaxed *while a model
+    # is being downloaded* (Whisper / embeddings) to survive a TLS-intercepting
+    # corporate proxy. Leave off unless you are on such a network and trust it —
+    # it widens a MITM window for the process during the download. Can also be
+    # forced with FETCHLY_INSECURE_MODEL_DOWNLOAD=1.
+    "insecure_model_download": False,
 }
 
 # Media keys that are plain on/off toggles.
@@ -83,6 +89,17 @@ def _write(data: dict[str, Any]) -> None:
 def get_config() -> dict[str, Any]:
     with _LOCK:
         return _read()
+
+
+def insecure_model_download() -> bool:
+    """Whether the (opt-in, default-off) relaxed-TLS model download is enabled.
+    Env var wins so it can be forced without editing config."""
+    env = os.environ.get("FETCHLY_INSECURE_MODEL_DOWNLOAD", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return bool(get_config().get("insecure_model_download", False))
 
 
 def get_settings() -> dict[str, Any]:

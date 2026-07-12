@@ -1,10 +1,10 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { DatabaseIcon, SearchIcon } from "lucide-react"
+import { DatabaseIcon, SearchIcon, SparklesIcon } from "lucide-react"
 import { toast } from "sonner"
 
-import { backend, type IndexStats } from "@/lib/backend"
+import { backend, type IndexStats, type SearchMetrics } from "@/lib/backend"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -18,6 +18,7 @@ function fmtBytes(n: number): string {
 
 export function IndexCard() {
   const [stats, setStats] = useState<IndexStats | null>(null)
+  const [metrics, setMetrics] = useState<SearchMetrics | null>(null)
   const [rebuildOpen, setRebuildOpen] = useState(false)
 
   async function refresh() {
@@ -30,6 +31,7 @@ export function IndexCard() {
 
   useEffect(() => {
     refresh()
+    backend.searchMetrics().then(setMetrics).catch(() => {})
   }, [])
 
   async function backfill() {
@@ -58,6 +60,27 @@ export function IndexCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {/* North-star made visible to the user themselves: how often their memory
+            worked for them. Purely local — computed from search_events. */}
+        {metrics && (
+          <div className="flex items-center gap-3 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2.5">
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/15 text-primary">
+              <SparklesIcon className="size-4" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-sm font-medium">
+                Votre mémoire travaille&nbsp;:{" "}
+                <span className="tabular-nums text-primary">{metrics.retrievals_week}</span>{" "}
+                {metrics.retrievals_week === 1 ? "retrouvaille" : "retrouvailles"} cette semaine
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {metrics.searches_week} recherche{metrics.searches_week === 1 ? "" : "s"} · une
+                retrouvaille = une recherche qui a mené à un passage ouvert.
+              </p>
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
           <Stat label="Contenus indexés" value={stats ? `${stats.indexed} / ${stats.total}` : "…"} />
           <Stat label="Passages (chunks)" value={stats ? String(stats.chunks) : "…"} />

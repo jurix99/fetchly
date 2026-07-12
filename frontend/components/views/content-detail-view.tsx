@@ -8,6 +8,7 @@ import {
   ExternalLinkIcon,
   FileTextIcon,
   Loader2Icon,
+  PlayIcon,
   RotateCcwIcon,
   SearchIcon,
   TriangleAlertIcon,
@@ -16,7 +17,13 @@ import {
 import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
-import { backend, type Content, type TranscriptDetail } from "@/lib/backend"
+import {
+  backend,
+  type Content,
+  type RelatedResult,
+  type TranscriptDetail,
+} from "@/lib/backend"
+import { savePlaybackPosition } from "@/lib/playback"
 import type { View } from "@/components/app-shell"
 import { useStore } from "@/components/store-provider"
 import { Button } from "@/components/ui/button"
@@ -55,11 +62,13 @@ export function ContentDetailView({
   startAt,
   onBack,
   onNavigate,
+  onOpenContent,
 }: {
   contentId: string
   startAt?: number
   onBack: () => void
   onNavigate: (v: View) => void
+  onOpenContent: (id: string, startAt?: number, queryHash?: string) => void
 }) {
   const { addDownload, settings } = useStore()
   const [content, setContent] = useState<Content | null>(null)
@@ -69,15 +78,50 @@ export function ContentDetailView({
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
+  // Arriving via a jump (startAt set) lands on the Transcript so the segment
+  // that matched is visible and pulses. Otherwise show the overview.
+  const [tab, setTab] = useState<string>(startAt !== undefined ? "transcript" : "apercu")
+  // Segment to pulse-highlight: the real phrase, i.e. after the 2 s recall.
+  const [pulseMs, setPulseMs] = useState<number | null>(
+    startAt !== undefined ? Math.round((startAt + 2) * 1000) : null,
+  )
   const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null)
+  const lastSaved = useRef(0)
 
+  // Stable so the transcript's pulse timer isn't reset on every timeupdate render.
+  const clearPulse = useCallback(() => setPulseMs(null), [])
+
+  /** Seek + play, and pulse/scroll the transcript segment at that moment. */
   function seek(seconds: number) {
     const el = mediaRef.current
     if (el) {
       el.currentTime = seconds
       el.play().catch(() => {})
     }
+    setTab("transcript")
+    setPulseMs(Math.round(seconds * 1000))
   }
+
+  // Persist the playback position (throttled) so the Library "Reprendre" block
+  // and resume-on-open work. Purely local (localStorage).
+  function onTimeUpdate(e: React.SyntheticEvent<HTMLMediaElement>) {
+    const el = e.currentTarget
+    setCurrentTime(el.currentTime)
+    const now = Date.now()
+    if (now - lastSaved.current > 4000) {
+      lastSaved.current = now
+      savePlaybackPosition(contentId, el.currentTime, el.duration || 0)
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      const el = mediaRef.current
+      if (el && el.currentTime > 0) {
+        savePlaybackPosition(contentId, el.currentTime, el.duration || 0)
+      }
+    }
+  }, [contentId])
 
   useEffect(() => {
     let alive = true
@@ -220,7 +264,7 @@ export function ContentDetailView({
             src={content.stream_url}
             controls
             onLoadedMetadata={onLoadedMetadata}
-            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            onTimeUpdate={onTimeUpdate}
             className="w-full"
           />
         </div>
@@ -231,7 +275,7 @@ export function ContentDetailView({
           poster={content.thumbnail_url ?? undefined}
           controls
           onLoadedMetadata={onLoadedMetadata}
-          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+          onTimeUpdate={onTimeUpdate}
           className="aspect-video w-full overflow-hidden rounded-xl bg-black"
         />
       )}
@@ -283,7 +327,7 @@ export function ContentDetailView({
       <Separator />
 
       {/* Tabs — structured so adding Résumé / Chat later is trivial. */}
-      <Tabs defaultValue="apercu" className="gap-4">
+      <Tabs value={tab} onValueChange={setTab} className="gap-4">
         <TabsList>
           <TabsTrigger value="apercu">Aperçu</TabsTrigger>
           <TabsTrigger value="transcript">Transcript</TabsTrigger>
@@ -318,11 +362,16 @@ export function ContentDetailView({
           <TranscriptTab
             contentId={content.id}
             currentTime={currentTime}
+            pulseMs={pulseMs}
+            onPulseDone={clearPulse}
             onSeek={seek}
             onNavigate={onNavigate}
           />
         </TabsContent>
       </Tabs>
+
+      {/* First crossing of the memory: other contents in the user's library. */}
+      <RelatedSection contentId={content.id} onSeek={seek} onOpenContent={onOpenContent} />
 
       <Separator />
 
@@ -379,11 +428,15 @@ function highlight(text: string, needle: string) {
 function TranscriptTab({
   contentId,
   currentTime,
+  pulseMs,
+  onPulseDone,
   onSeek,
   onNavigate,
 }: {
   contentId: string
   currentTime: number
+  pulseMs: number | null
+  onPulseDone: () => void
   onSeek: (seconds: number) => void
   onNavigate: (v: View) => void
 }) {
@@ -392,7 +445,9 @@ function TranscriptTab({
   const [q, setQ] = useState("")
   const [autoScroll, setAutoScroll] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [pulseIdx, setPulseIdx] = useState<number | null>(null)
   const activeRef = useRef<HTMLButtonElement>(null)
+  const pulseRef = useRef<HTMLButtonElement>(null)
 
   const load = useCallback(async () => {
     try {
@@ -428,6 +483,27 @@ function TranscriptTab({
       activeRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" })
     }
   }, [activeIdx, autoScroll])
+
+  // Jump-to-second: pulse the segment matching `pulseMs`, scroll it into view,
+  // then clear the pulse after 2 s. Runs once segments are loaded.
+  useEffect(() => {
+    if (pulseMs == null || segments.length === 0) return
+    const idx = segments.findIndex((s) => pulseMs >= s.start_ms && pulseMs < s.end_ms)
+    const target = idx >= 0 ? idx : segments.findIndex((s) => s.start_ms >= pulseMs)
+    if (target < 0) return
+    setPulseIdx(target)
+    const t = setTimeout(() => {
+      setPulseIdx(null)
+      onPulseDone()
+    }, 2000)
+    return () => clearTimeout(t)
+  }, [pulseMs, segments, onPulseDone])
+
+  useEffect(() => {
+    if (pulseIdx != null) {
+      pulseRef.current?.scrollIntoView({ block: "center", behavior: "smooth" })
+    }
+  }, [pulseIdx])
 
   async function transcribe() {
     setBusy(true)
@@ -553,12 +629,16 @@ function TranscriptTab({
         {rows.map(({ s, i }) => (
           <button
             key={i}
-            ref={i === activeIdx ? activeRef : undefined}
+            ref={(el) => {
+              if (i === activeIdx) activeRef.current = el
+              if (i === pulseIdx) pulseRef.current = el
+            }}
             type="button"
             onClick={() => onSeek(s.start_ms / 1000)}
             className={cn(
               "flex gap-3 border-b border-border/50 px-3 py-1.5 text-left text-sm transition-colors last:border-0 hover:bg-muted/50",
               i === activeIdx && "bg-primary/10",
+              i === pulseIdx && "animate-seek-pulse",
             )}
           >
             <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-primary">
@@ -570,6 +650,103 @@ function TranscriptTab({
         {rows.length === 0 && (
           <p className="p-3 text-center text-sm text-muted-foreground">Aucun résultat.</p>
         )}
+      </div>
+    </div>
+  )
+}
+
+/** "Dans votre bibliothèque" — the first crossing of the memory. Hidden entirely
+ *  when there's nothing close (never a disappointing empty section). For the
+ *  closest link, shows the best "ce moment ↔ ce moment" passage pair. */
+function RelatedSection({
+  contentId,
+  onSeek,
+  onOpenContent,
+}: {
+  contentId: string
+  onSeek: (seconds: number) => void
+  onOpenContent: (id: string, startAt?: number) => void
+}) {
+  const [results, setResults] = useState<RelatedResult[] | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    setResults(null)
+    backend
+      .related(contentId, 5)
+      .then((r) => alive && setResults(r.results))
+      .catch(() => alive && setResults([]))
+    return () => {
+      alive = false
+    }
+  }, [contentId])
+
+  if (!results || results.length === 0) return null
+
+  const bridge = results.find((r) => r.pair)
+
+  return (
+    <div className="flex flex-col gap-3">
+      <h2 className="text-sm font-semibold">Dans votre bibliothèque</h2>
+
+      {bridge?.pair && (
+        <div className="flex flex-col gap-2 rounded-xl border border-border bg-muted/30 p-3">
+          <p className="text-xs text-muted-foreground">
+            Ce moment fait écho à{" "}
+            <span className="font-medium text-foreground">{bridge.title}</span>
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => onSeek(bridge.pair!.a_start_ms / 1000)}
+              className="flex flex-col gap-1 rounded-lg border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/40"
+            >
+              <span className="flex items-center gap-1.5 text-xs font-medium text-primary">
+                <PlayIcon className="size-3" /> Ici · {fmtMs(bridge.pair.a_start_ms)}
+              </span>
+              <span className="line-clamp-2 text-xs text-foreground/80">{bridge.pair.a_text}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                onOpenContent(bridge.id, Math.max(0, bridge.pair!.b_start_ms / 1000 - 2))
+              }
+              className="flex flex-col gap-1 rounded-lg border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/40"
+            >
+              <span className="flex items-center gap-1.5 text-xs font-medium text-primary">
+                <ExternalLinkIcon className="size-3" /> Là-bas · {fmtMs(bridge.pair.b_start_ms)}
+              </span>
+              <span className="line-clamp-2 text-xs text-foreground/80">{bridge.pair.b_text}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+        {results.map((r) => (
+          <button
+            key={r.id}
+            type="button"
+            onClick={() => onOpenContent(r.id)}
+            className="group flex flex-col gap-1.5 rounded-lg border border-transparent p-1 text-left transition-colors hover:bg-muted/50"
+          >
+            <div className="relative aspect-video w-full overflow-hidden rounded-md bg-muted">
+              {r.thumbnail_url ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={r.thumbnail_url} alt="" className="size-full object-cover" />
+              ) : (
+                <div className="flex size-full items-center justify-center text-muted-foreground">
+                  <PlayIcon className="size-5" />
+                </div>
+              )}
+              <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 text-[10px] font-medium text-white tabular-nums">
+                {Math.round(r.score * 100)}%
+              </span>
+            </div>
+            <p className="line-clamp-2 text-xs font-medium leading-snug">{r.title}</p>
+            <p className="truncate text-[11px] text-muted-foreground">{r.channel}</p>
+          </button>
+        ))}
       </div>
     </div>
   )

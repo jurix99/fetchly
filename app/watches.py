@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from . import jobs, store
+from . import db, jobs, store
 from .plugins.builtin import ytdlp_source as ytsrc
 from .runtime import (
     DOWNLOAD_DIR,
@@ -52,6 +52,12 @@ def _enforce_keep_last(folder: Path, n: int, log: list[str]) -> None:
                 except OSError:
                     pass
         if removed:
+            # Cascade the library/index entry too, so the pruned file leaves no
+            # ghost content row or orphan vectors behind.
+            try:
+                db.content_delete_by_filepath(str(p))
+            except Exception:  # noqa: BLE001 — retention must never break a check
+                pass
             log.append(f"keepLastN: fichier ancien supprimé « {p.name} »")
 
 

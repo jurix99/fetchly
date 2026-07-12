@@ -119,6 +119,13 @@ class BackfillRequest(BaseModel):
     only_missing: bool = True
 
 
+class SearchFeedbackRequest(BaseModel):
+    """LOCAL north-star instrumentation. `query_hash` comes back from /api/search;
+    `clicked` marks that the search led to opening a result."""
+    query_hash: str = ""
+    clicked: bool = False
+
+
 # Default filter template (mirrors the source plugin's _DEFAULT_FILTERS).
 DEFAULT_FILTERS = {
     "min_duration": None,

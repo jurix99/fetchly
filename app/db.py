@@ -129,6 +129,29 @@ def init() -> None:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_content ON transcript_segments(content_id)")
     # Small key/value store for one-shot flags (e.g. library migration done).
     _conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # North-star instrumentation — strictly LOCAL (never leaves this DB). One row
+    # per search; `clicked` flips to 1 when a result is opened (a "retrouvaille").
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS search_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL, query_hash TEXT, results_count INTEGER,
+            clicked INTEGER DEFAULT 0
+        )
+        """
+    )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_search_events_hash ON search_events(query_hash)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_search_events_ts ON search_events(ts)")
+    # Per-content "related contents" cache. Invalidated by a global index version
+    # bumped whenever any content finishes indexing (superset of "one of the two
+    # changed", which is the correctness requirement).
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS related_cache (
+            content_id TEXT PRIMARY KEY, index_version INTEGER, payload TEXT
+        )
+        """
+    )
     _init_search()
     _conn.commit()
 
@@ -197,13 +220,42 @@ def _init_search() -> None:
             globals()["VEC_OK"] = False
 
 
-# --- Key/value meta --------------------------------------------------------
-def meta_get(key: str) -> str | None:
+# --- Read path (per-thread, lock-free) -------------------------------------
+# WAL lets many readers run concurrently with the single writer. Reads therefore
+# use a per-thread, read-only connection and take NO _LOCK, so a long index/
+# transcription write batch never stalls search or library browsing. Writes keep
+# using the shared _conn under _LOCK (serialised across writer threads).
+_read_local = threading.local()
+
+
+def _reader() -> sqlite3.Connection | None:
+    """A per-thread read-only connection (created lazily), or None before init."""
     if _conn is None:
         return None
-    with _LOCK:
-        cur = _conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
-        row = cur.fetchone()
+    conn = getattr(_read_local, "conn", None)
+    if conn is not None:
+        return conn
+    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False, isolation_level=None)
+    conn.execute("PRAGMA busy_timeout=5000")
+    if VEC_OK:
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:  # noqa: BLE001 — reader falls back to lexical-only
+            pass
+    conn.execute("PRAGMA query_only=1")  # hard guard: readers can't write
+    _read_local.conn = conn
+    return conn
+
+
+# --- Key/value meta --------------------------------------------------------
+def meta_get(key: str) -> str | None:
+    conn = _reader()
+    if conn is None:
+        return None
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
 
 
@@ -250,38 +302,64 @@ def content_upsert(row: dict[str, Any]) -> None:
 
 
 def content_get(content_id: str) -> dict[str, Any] | None:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return None
-    with _LOCK:
-        cur = _conn.execute(
-            f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE id = ?", (content_id,)
-        )
-        row = cur.fetchone()
+    row = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE id = ?", (content_id,)
+    ).fetchone()
     return dict(zip(CONTENT_COLUMNS, row)) if row else None
 
 
 def content_by_filepath(filepath: str) -> dict[str, Any] | None:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return None
-    with _LOCK:
-        cur = _conn.execute(
-            f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE filepath = ?", (filepath,)
-        )
-        row = cur.fetchone()
+    row = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE filepath = ?", (filepath,)
+    ).fetchone()
     return dict(zip(CONTENT_COLUMNS, row)) if row else None
 
 
 def content_filepaths() -> set[str]:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return set()
-    with _LOCK:
-        cur = _conn.execute("SELECT filepath FROM contents")
-        return {r[0] for r in cur.fetchall() if r[0]}
+    cur = conn.execute("SELECT filepath FROM contents")
+    return {r[0] for r in cur.fetchall() if r[0]}
+
+
+def _bump_index_version() -> None:
+    """Increment the global index version (invalidates related caches). Caller
+    must hold _LOCK and commit."""
+    assert _conn is not None
+    cur = _conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
+    version = (int(cur[0]) if cur and cur[0] else 0) + 1
+    _conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('index_version', ?)", (str(version),)
+    )
+
+
+def _purge_index_rows(content_id: str) -> None:
+    """Drop every search/index artefact for a content: chunks, their vectors,
+    segments (the AFTER DELETE trigger cleans segments_fts), and any related
+    cache. Caller must hold _LOCK and commit. contents_fts is cleaned by the
+    contents AFTER DELETE trigger when the row itself is removed."""
+    assert _conn is not None
+    ids = [r[0] for r in _conn.execute(
+        "SELECT id FROM transcript_chunks WHERE content_id = ?", (content_id,)
+    ).fetchall()]
+    if ids and VEC_OK:
+        _conn.executemany("DELETE FROM vec_chunks WHERE chunk_id = ?", [(i,) for i in ids])
+    _conn.execute("DELETE FROM transcript_chunks WHERE content_id = ?", (content_id,))
+    _conn.execute("DELETE FROM transcript_segments WHERE content_id = ?", (content_id,))
+    _conn.execute("DELETE FROM related_cache WHERE content_id = ?", (content_id,))
 
 
 def content_delete(content_id: str) -> str | None:
-    """Remove a content row; returns its filepath so the caller can optionally
-    delete the file too."""
+    """Remove a content row **and all its memory** (segments, chunks, vectors,
+    FTS, related cache) so nothing is left pointing at a gone content. Returns
+    its filepath so the caller can optionally delete the file too."""
     if _conn is None:
         return None
     with _LOCK:
@@ -289,9 +367,67 @@ def content_delete(content_id: str) -> str | None:
         row = cur.fetchone()
         if not row:
             return None
+        _purge_index_rows(content_id)
         _conn.execute("DELETE FROM contents WHERE id = ?", (content_id,))
+        _bump_index_version()
         _conn.commit()
     return row[0]
+
+
+def content_delete_by_filepath(filepath: str) -> bool:
+    """Cascade-delete the content row for a media file removed off-band (e.g.
+    keepLastN pruning), so no ghost row / orphan vectors survive."""
+    if _conn is None or not filepath:
+        return False
+    with _LOCK:
+        row = _conn.execute("SELECT id FROM contents WHERE filepath = ?", (filepath,)).fetchone()
+        if not row:
+            return False
+        cid = row[0]
+        _purge_index_rows(cid)
+        _conn.execute("DELETE FROM contents WHERE id = ?", (cid,))
+        _bump_index_version()
+        _conn.commit()
+    return True
+
+
+def gc_orphans() -> dict[str, int]:
+    """Startup garbage-collect: drop index rows whose content no longer exists
+    (from crashes or off-band file removal) so the KNN isn't polluted by orphan
+    vectors forever. Cheap; runs once at boot."""
+    if _conn is None:
+        return {}
+    with _LOCK:
+        orphan_chunks = [r[0] for r in _conn.execute(
+            "SELECT id FROM transcript_chunks WHERE content_id NOT IN (SELECT id FROM contents)"
+        ).fetchall()]
+        if orphan_chunks and VEC_OK:
+            _conn.executemany("DELETE FROM vec_chunks WHERE chunk_id = ?", [(i,) for i in orphan_chunks])
+        c = _conn.execute(
+            "DELETE FROM transcript_chunks WHERE content_id NOT IN (SELECT id FROM contents)"
+        ).rowcount
+        s = _conn.execute(
+            "DELETE FROM transcript_segments WHERE content_id NOT IN (SELECT id FROM contents)"
+        ).rowcount
+        r = _conn.execute(
+            "DELETE FROM related_cache WHERE content_id NOT IN (SELECT id FROM contents)"
+        ).rowcount
+        # Vectors whose chunk row is gone (belt and braces around the join above).
+        stray = 0
+        if VEC_OK:
+            try:
+                ids = [x[0] for x in _conn.execute(
+                    "SELECT chunk_id FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM transcript_chunks)"
+                ).fetchall()]
+                if ids:
+                    _conn.executemany("DELETE FROM vec_chunks WHERE chunk_id = ?", [(i,) for i in ids])
+                    stray = len(ids)
+            except Exception:  # noqa: BLE001 — vec0 metadata scan unsupported → skip
+                pass
+        if c or s or r or stray:
+            _bump_index_version()
+        _conn.commit()
+    return {"chunks": c, "segments": s, "related": r, "stray_vectors": stray}
 
 
 def content_list(
@@ -320,14 +456,16 @@ def content_list(
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     sort_col = sort if sort in _SORTABLE else "downloaded_at"
     direction = "ASC" if str(order).lower() == "asc" else "DESC"
-    with _LOCK:
-        total = _conn.execute(f"SELECT COUNT(*) FROM contents{clause}", params).fetchone()[0]
-        cur = _conn.execute(
-            f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents{clause} "
-            f"ORDER BY {sort_col} {direction} LIMIT ? OFFSET ?",
-            [*params, max(1, min(limit, 200)), max(0, offset)],
-        )
-        rows = [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+    conn = _reader()
+    if conn is None:
+        return [], 0
+    total = conn.execute(f"SELECT COUNT(*) FROM contents{clause}", params).fetchone()[0]
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents{clause} "
+        f"ORDER BY {sort_col} {direction} LIMIT ? OFFSET ?",
+        [*params, max(1, min(limit, 200)), max(0, offset)],
+    )
+    rows = [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
     return rows, total
 
 
@@ -424,15 +562,15 @@ def segments_replace(content_id: str, segments: list[tuple[int, int, str]]) -> N
 
 
 def segments_get(content_id: str) -> list[dict[str, Any]]:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return []
-    with _LOCK:
-        cur = _conn.execute(
-            "SELECT start_ms, end_ms, text FROM transcript_segments "
-            "WHERE content_id = ? ORDER BY start_ms ASC",
-            (content_id,),
-        )
-        return [{"start_ms": r[0], "end_ms": r[1], "text": r[2]} for r in cur.fetchall()]
+    cur = conn.execute(
+        "SELECT start_ms, end_ms, text FROM transcript_segments "
+        "WHERE content_id = ? ORDER BY start_ms ASC",
+        (content_id,),
+    )
+    return [{"start_ms": r[0], "end_ms": r[1], "text": r[2]} for r in cur.fetchall()]
 
 
 def segments_delete(content_id: str) -> None:
@@ -449,7 +587,18 @@ def content_set_index(content_id: str, status: str) -> None:
         return
     with _LOCK:
         _conn.execute("UPDATE contents SET index_status = ? WHERE id = ?", (status, content_id))
+        # Any index change invalidates the related-contents caches (see related_cache).
+        _bump_index_version()
         _conn.commit()
+
+
+def index_version() -> int:
+    """Monotonic counter bumped on every index change; keys the related cache."""
+    conn = _reader()
+    if conn is None:
+        return 0
+    cur = conn.execute("SELECT value FROM meta WHERE key = 'index_version'").fetchone()
+    return int(cur[0]) if cur and cur[0] else 0
 
 
 def contents_to_index() -> list[dict[str, Any]]:
@@ -524,7 +673,8 @@ def _fts_query(tokens: list[str]) -> str:
 
 
 def fts_segments(tokens: list[str], limit: int, content_id: str | None = None) -> list[dict[str, Any]]:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return []
     q = _fts_query(tokens)
     if not q:
@@ -535,22 +685,22 @@ def fts_segments(tokens: list[str], limit: int, content_id: str | None = None) -
         where += " AND content_id = ?"
         params.append(content_id)
     params.append(limit)
-    with _LOCK:
-        try:
-            cur = _conn.execute(
-                f"SELECT content_id, start_ms, "
-                f"snippet(segments_fts, 0, char(2), char(3), '…', 12) AS snip, "
-                f"bm25(segments_fts) AS rank "
-                f"FROM segments_fts WHERE {where} ORDER BY rank LIMIT ?",
-                params,
-            )
-            return [{"content_id": r[0], "start_ms": r[1], "snippet": r[2], "rank": r[3]} for r in cur.fetchall()]
-        except Exception:  # noqa: BLE001 — malformed FTS query
-            return []
+    try:
+        cur = conn.execute(
+            f"SELECT content_id, start_ms, "
+            f"snippet(segments_fts, 0, char(2), char(3), '…', 12) AS snip, "
+            f"bm25(segments_fts) AS rank "
+            f"FROM segments_fts WHERE {where} ORDER BY rank LIMIT ?",
+            params,
+        )
+        return [{"content_id": r[0], "start_ms": r[1], "snippet": r[2], "rank": r[3]} for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001 — malformed FTS query
+        return []
 
 
 def fts_contents(tokens: list[str], limit: int, content_id: str | None = None) -> list[dict[str, Any]]:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return []
     q = _fts_query(tokens)
     if not q:
@@ -561,55 +711,160 @@ def fts_contents(tokens: list[str], limit: int, content_id: str | None = None) -
         where += " AND content_id = ?"
         params.append(content_id)
     params.append(limit)
-    with _LOCK:
-        try:
-            cur = _conn.execute(
-                f"SELECT content_id, bm25(contents_fts) AS rank "
-                f"FROM contents_fts WHERE {where} ORDER BY rank LIMIT ?",
-                params,
-            )
-            return [{"content_id": r[0], "rank": r[1]} for r in cur.fetchall()]
-        except Exception:  # noqa: BLE001
-            return []
+    try:
+        cur = conn.execute(
+            f"SELECT content_id, bm25(contents_fts) AS rank "
+            f"FROM contents_fts WHERE {where} ORDER BY rank LIMIT ?",
+            params,
+        )
+        return [{"content_id": r[0], "rank": r[1]} for r in cur.fetchall()]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def vec_knn(embedding_blob: bytes, k: int) -> list[dict[str, Any]]:
-    if _conn is None or not VEC_OK:
+    conn = _reader()
+    if conn is None or not VEC_OK:
         return []
+    try:
+        # The LIMIT/k constraint must sit directly on the vec0 scan, so run
+        # the KNN in a subquery and join chunk metadata around it.
+        cur = conn.execute(
+            "SELECT c.content_id, c.start_ms, c.end_ms, c.text, k.distance "
+            "FROM (SELECT chunk_id, distance FROM vec_chunks "
+            "      WHERE embedding MATCH ? ORDER BY distance LIMIT ?) k "
+            "JOIN transcript_chunks c ON c.id = k.chunk_id "
+            "ORDER BY k.distance",
+            (embedding_blob, k),
+        )
+        return [
+            {"content_id": r[0], "start_ms": r[1], "end_ms": r[2], "text": r[3], "distance": r[4]}
+            for r in cur.fetchall()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[db] vec_knn: {exc}", flush=True)
+        return []
+
+
+def chunks_of(content_id: str) -> list[dict[str, Any]]:
+    """A content's semantic chunks (id + span + text), ordered — the unit used to
+    compute cross-content similarity for 'related'."""
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        "SELECT id, start_ms, end_ms, text FROM transcript_chunks "
+        "WHERE content_id = ? ORDER BY start_ms ASC",
+        (content_id,),
+    )
+    return [{"id": r[0], "start_ms": r[1], "end_ms": r[2], "text": r[3]} for r in cur.fetchall()]
+
+
+def vec_get(chunk_id: int) -> bytes | None:
+    """The stored float32 embedding blob for a chunk (reused as a KNN query so we
+    never re-embed when computing related contents). None if vec unavailable."""
+    conn = _reader()
+    if conn is None or not VEC_OK:
+        return None
+    try:
+        row = conn.execute("SELECT embedding FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    return row[0] if row and row[0] is not None else None
+
+
+# --- Related-contents cache ------------------------------------------------
+def related_cache_get(content_id: str, version: int) -> str | None:
+    """Cached related payload for a content, only if still fresh (matching the
+    current index version). Returns the JSON string, or None on miss/stale."""
+    conn = _reader()
+    if conn is None:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM related_cache WHERE content_id = ? AND index_version = ?",
+        (content_id, version),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def related_cache_set(content_id: str, version: int, payload: str) -> None:
+    if _conn is None:
+        return
     with _LOCK:
-        try:
-            # The LIMIT/k constraint must sit directly on the vec0 scan, so run
-            # the KNN in a subquery and join chunk metadata around it.
-            cur = _conn.execute(
-                "SELECT c.content_id, c.start_ms, c.end_ms, c.text, k.distance "
-                "FROM (SELECT chunk_id, distance FROM vec_chunks "
-                "      WHERE embedding MATCH ? ORDER BY distance LIMIT ?) k "
-                "JOIN transcript_chunks c ON c.id = k.chunk_id "
-                "ORDER BY k.distance",
-                (embedding_blob, k),
-            )
-            return [
-                {"content_id": r[0], "start_ms": r[1], "end_ms": r[2], "text": r[3], "distance": r[4]}
-                for r in cur.fetchall()
-            ]
-        except Exception as exc:  # noqa: BLE001
-            print(f"[db] vec_knn: {exc}", flush=True)
-            return []
+        _conn.execute(
+            "INSERT OR REPLACE INTO related_cache (content_id, index_version, payload) "
+            "VALUES (?, ?, ?)",
+            (content_id, version, payload),
+        )
+        _conn.commit()
+
+
+# --- North-star instrumentation (LOCAL only) -------------------------------
+def search_event_insert(query_hash: str, results_count: int) -> None:
+    """Record one search. `clicked` stays 0 until a result is opened."""
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute(
+            "INSERT INTO search_events (ts, query_hash, results_count, clicked) VALUES (?, ?, ?, 0)",
+            (time.time(), query_hash, int(results_count)),
+        )
+        _conn.commit()
+
+
+def search_event_mark_clicked(query_hash: str) -> None:
+    """Flip the most recent (recent = last hour) search for this query to a
+    'retrouvaille'. Idempotent-ish: only the latest matching row is marked."""
+    if _conn is None:
+        return
+    with _LOCK:
+        row = _conn.execute(
+            "SELECT id FROM search_events WHERE query_hash = ? AND clicked = 0 "
+            "AND ts >= ? ORDER BY ts DESC LIMIT 1",
+            (query_hash, time.time() - 3600),
+        ).fetchone()
+        if row:
+            _conn.execute("UPDATE search_events SET clicked = 1 WHERE id = ?", (row[0],))
+            _conn.commit()
+
+
+def search_metrics(window_days: int = 7) -> dict[str, Any]:
+    """Aggregate local usage for the 'Votre mémoire travaille' card. A
+    'retrouvaille' = a search that led to opening a result."""
+    conn = _reader()
+    if conn is None:
+        return {"retrievals_week": 0, "searches_week": 0, "retrievals_total": 0}
+    since = time.time() - window_days * 86400
+    searches_week = conn.execute(
+        "SELECT COUNT(*) FROM search_events WHERE ts >= ?", (since,)
+    ).fetchone()[0]
+    retrievals_week = conn.execute(
+        "SELECT COUNT(*) FROM search_events WHERE clicked = 1 AND ts >= ?", (since,)
+    ).fetchone()[0]
+    retrievals_total = conn.execute(
+        "SELECT COUNT(*) FROM search_events WHERE clicked = 1"
+    ).fetchone()[0]
+    return {
+        "retrievals_week": retrievals_week,
+        "searches_week": searches_week,
+        "retrievals_total": retrievals_total,
+        "window_days": window_days,
+    }
 
 
 def index_stats() -> dict[str, Any]:
-    if _conn is None:
+    conn = _reader()
+    if conn is None:
         return {}
-    with _LOCK:
-        total = _conn.execute("SELECT COUNT(*) FROM contents").fetchone()[0]
-        indexed = _conn.execute("SELECT COUNT(*) FROM contents WHERE index_status = 'done'").fetchone()[0]
-        chunks = _conn.execute("SELECT COUNT(*) FROM transcript_chunks").fetchone()[0]
-        try:
-            page_count = _conn.execute("PRAGMA page_count").fetchone()[0]
-            page_size = _conn.execute("PRAGMA page_size").fetchone()[0]
-            db_bytes = page_count * page_size
-        except Exception:  # noqa: BLE001
-            db_bytes = 0
+    total = conn.execute("SELECT COUNT(*) FROM contents").fetchone()[0]
+    indexed = conn.execute("SELECT COUNT(*) FROM contents WHERE index_status = 'done'").fetchone()[0]
+    chunks = conn.execute("SELECT COUNT(*) FROM transcript_chunks").fetchone()[0]
+    try:
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        db_bytes = page_count * page_size
+    except Exception:  # noqa: BLE001
+        db_bytes = 0
     return {"total": total, "indexed": indexed, "chunks": chunks, "db_bytes": db_bytes, "vec_ok": VEC_OK}
 
 

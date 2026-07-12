@@ -76,6 +76,28 @@ auto-refreshed, so you rarely re-deposit them. They also unlock **Mon YouTube**
 (Watch Later / liked / subscriptions) and clear the "confirm you're not a bot"
 check. Tip: use a throwaway Google account.
 
+## Security & exposure
+
+Fetchly is a **trusted-LAN, single-user** app: it ships with **no authentication
+and no CORS restrictions**, and the API can delete library entries and stream any
+downloaded file (`DELETE /api/library/{id}`, `GET /api/library/{id}/stream`).
+
+- **Do not expose it directly to the internet.** Put it behind a reverse proxy
+  (Caddy, Nginx, Traefik…) that adds TLS **and** authentication (basic auth, an
+  SSO/forward-auth, or a VPN like Tailscale/WireGuard). Keep the container bound
+  to your LAN / a private network.
+- Model downloads (Whisper / embeddings) verify TLS by default. On a network with
+  a TLS-intercepting proxy you can opt in to relaxed verification **for the
+  download only** with `insecure_model_download` (config) or
+  `FETCHLY_INSECURE_MODEL_DOWNLOAD=1` — leave it **off** otherwise.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest            # pure-function + DB-integrity tests (no network, no models)
+```
+
 ## Notes
 
 - yt-dlp + YouTube is a moving target. If downloads start failing, rebuild to

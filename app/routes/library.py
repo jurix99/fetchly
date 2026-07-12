@@ -4,19 +4,17 @@ for instant seek), delete entries (± file), and trigger a rescan."""
 from __future__ import annotations
 
 import mimetypes
-import re
 from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import db, library
+from .. import db, indexer, library
 from ..runtime import DOWNLOAD_DIR
 
 router = APIRouter()
 
 _CHUNK = 256 * 1024
-_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 @router.get("/api/library")
@@ -52,6 +50,16 @@ async def get_content(content_id: str) -> JSONResponse:
     return JSONResponse(library.to_public(row))
 
 
+@router.get("/api/library/{content_id}/related")
+async def related_content(content_id: str, limit: int = 5) -> JSONResponse:
+    """Contents in the user's own library close to this one (the first crossing of
+    the memory). Cached per content, invalidated when either side re-indexes."""
+    row = db.content_get(content_id)
+    if not row:
+        return JSONResponse({"error": "Contenu inconnu"}, status_code=404)
+    return JSONResponse(indexer.related(content_id, limit=max(1, min(limit, 10))))
+
+
 @router.delete("/api/library/{content_id}")
 async def delete_content(content_id: str, delete_file: bool = False) -> JSONResponse:
     row = db.content_get(content_id)
@@ -66,11 +74,7 @@ async def delete_content(content_id: str, delete_file: bool = False) -> JSONResp
 
 
 def _within_downloads(path: Path) -> bool:
-    try:
-        path.resolve().relative_to(DOWNLOAD_DIR.resolve())
-        return True
-    except (ValueError, OSError):
-        return False
+    return library.is_within(path, DOWNLOAD_DIR)
 
 
 def _delete_files(row: dict) -> bool:
@@ -116,13 +120,9 @@ async def stream_content(content_id: str, request: Request):
     file_size = path.stat().st_size
     ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
-    range_header = request.headers.get("range")
-    if range_header:
-        m = _RANGE_RE.match(range_header)
-        start = int(m.group(1)) if m and m.group(1) else 0
-        end = int(m.group(2)) if m and m.group(2) else file_size - 1
-        end = min(end, file_size - 1)
-        start = max(0, min(start, end))
+    rng = library.parse_byte_range(request.headers.get("range"), file_size)
+    if rng:
+        start, end = rng
         length = end - start + 1
 
         def iter_range():
