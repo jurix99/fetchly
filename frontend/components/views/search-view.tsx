@@ -7,6 +7,7 @@ import {
   SearchIcon,
   SparklesIcon,
   SlidersHorizontalIcon,
+  StickyNoteIcon,
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -370,7 +371,18 @@ function ResultCard({
                   {fmtMs(p.start_ms)}
                 </span>
                 <span className="min-w-0 text-sm text-foreground/90">
+                  {p.match_type === "note" && (
+                    <Badge
+                      variant="outline"
+                      className="mr-1.5 gap-1 border-warning/40 bg-warning/15 align-[1px] text-[10px] text-warning"
+                    >
+                      <StickyNoteIcon className="size-2.5" /> note
+                    </Badge>
+                  )}
                   <HighlightedText text={p.text} highlights={p.highlights} />
+                  {p.match_type === "note" && p.verbatim && (
+                    <span className="ml-1 italic text-muted-foreground">« {p.verbatim} »</span>
+                  )}
                   {p.match_type === "semantic" && (
                     <Tooltip>
                       <TooltipTrigger

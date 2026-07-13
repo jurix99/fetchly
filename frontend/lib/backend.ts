@@ -64,6 +64,7 @@ export interface BackendWatch {
   thumbnail?: string | null
   enabled: boolean
   backfill: boolean
+  podcast_feed?: boolean
   synced?: number
   total?: number
   last_checked: string | null
@@ -205,6 +206,9 @@ export interface Content {
   summary_generated_at: number | null
   generation_status: GenerationStatus
   chapter_count: number
+  // digest (phase 3)
+  seen_at: number | null
+  watch_later: boolean
   // added by the API serializer
   thumbnail_url: string | null
   stream_url: string
@@ -261,6 +265,55 @@ export interface Chapter {
   title: string
 }
 
+// --- Highlights + clips (attention capteurs) ------------------------------
+export interface Highlight {
+  id: number
+  content_id: string
+  start_ms: number
+  end_ms: number
+  text: string
+  note: string | null
+  color: string
+  created_at: number
+  // present on the global /api/highlights list
+  content_title?: string
+  content_channel?: string
+  content_thumbnail_url?: string | null
+}
+
+export interface Clip {
+  id: string
+  content_id: string
+  path: string
+  format: "video" | "audio"
+  start_ms: number
+  end_ms: number
+  created_at: number
+  name: string
+  url: string
+  exists: boolean
+}
+
+// --- Podcast feeds --------------------------------------------------------
+export interface FeedsConfig {
+  enabled: boolean
+  audio_format: "m4a" | "opus"
+  bitrate: string
+  token: string
+  public_base_url: string
+  all_feed_url: string
+  stats: { active_feeds: number; episodes_ready: number; audio_bytes: number }
+}
+
+export interface WatchFeedStatus {
+  watch_id: string
+  podcast_feed: boolean
+  has_base: boolean
+  url: string
+  episodes_ready: number
+  missing_count: number
+}
+
 export interface LibraryPage {
   items: Content[]
   total: number
@@ -293,6 +346,7 @@ export interface TranscriptJob {
   status: "queued" | "running" | "done" | "error" | "canceled"
   progress: number
   model: string
+  engine?: "local" | "cloud"
   created_at: number
   duration_ms?: number | null
   error?: string
@@ -307,6 +361,11 @@ export interface TranscriptStatusInfo {
   active: number
   schedule: string
   window_open: boolean
+  // Cloud engine (optional; default local)
+  engine?: "local" | "cloud"
+  cloud_preset?: string
+  cloud_minutes?: number
+  cloud_month?: string
 }
 
 export interface TranscriptDetail {
@@ -336,7 +395,10 @@ export interface SearchPassage {
   text: string
   /** Char offsets [start, end) of highlighted spans within `text` (lexical only). */
   highlights?: [number, number][]
-  match_type: "lexical" | "semantic"
+  match_type: "lexical" | "semantic" | "note"
+  /** For a "note" passage: the highlighted verbatim behind the note. */
+  verbatim?: string
+  highlight_id?: number
   score: number
 }
 
@@ -402,6 +464,65 @@ export interface SearchMetrics {
   searches_week: number
   retrievals_total: number
   window_days: number
+}
+
+// --- Digest ---------------------------------------------------------------
+export interface DigestItem {
+  id: string
+  title: string
+  channel: string
+  source: string
+  duration_seconds: number | null
+  thumbnail_url: string | null
+  summary_short: string
+  transcript_status: TranscriptStatus
+  generation_status: GenerationStatus
+  watch_id: string | null
+  watch_later: boolean
+  downloaded_at: number | null
+}
+
+export interface DigestSubscription {
+  watch_id: string | null
+  name: string
+  avatar: string
+  count: number
+  items: DigestItem[]
+}
+
+export interface DigestDay {
+  date: string // YYYY-MM-DD
+  subscriptions: DigestSubscription[]
+}
+
+export interface DigestEcho {
+  new: DigestItem
+  old: DigestItem
+  score: number
+  pair: {
+    a_start_ms: number
+    a_text: string
+    b_start_ms: number
+    b_text: string
+    score: number
+  }
+}
+
+export interface DigestResponse {
+  since: number
+  stats: { count: number; total_duration_s: number; watches_count: number }
+  new: DigestDay[]
+  echoes: DigestEcho[]
+  watch_later: DigestItem[]
+}
+
+export interface DigestSettings {
+  last_seen_at: string
+  email_enabled: boolean
+  email_day: number // 0=Mon … 6=Sun
+  email_hour: number
+  email_last_sent: string
+  public_base_url: string
 }
 
 export interface BackendCookies {
@@ -538,6 +659,7 @@ export const backend = {
       exclude_shorts: boolean
       exclude_lives: boolean
       filters: BackendFilters
+      podcast_feed: boolean
     }>,
   ) => call<BackendWatch>("PATCH", `/api/watches/${id}`, b),
   removeWatch: (id: string) => call<{ removed: boolean }>("DELETE", `/api/watches/${id}`),
@@ -618,6 +740,45 @@ export const backend = {
     call<{ status: string }>("POST", `/api/generation-jobs/${id}/cancel`),
   getChapters: (id: string) =>
     call<{ content_id: string; chapters: Chapter[] }>("GET", `/api/library/${id}/chapters`),
+  // --- digest ---
+  digest: () => call<DigestResponse>("GET", "/api/digest"),
+  digestNewCount: () => call<{ count: number }>("GET", "/api/digest/new-count"),
+  digestSeen: (b: { content_ids?: string[]; all?: boolean }) =>
+    call<{ ok: boolean }>("POST", "/api/digest/seen", b),
+  digestSettings: () => call<DigestSettings>("GET", "/api/digest/settings"),
+  saveDigestSettings: (
+    b: Partial<{ email_enabled: boolean; email_day: number; email_hour: number; public_base_url: string }>,
+  ) => call<DigestSettings>("POST", "/api/digest/settings", b),
+  digestEmailPreview: () =>
+    call<{ ok: boolean; message: string }>("POST", "/api/digest/email-preview"),
+  setWatchLater: (id: string, value: boolean) =>
+    call<{ id: string; watch_later: boolean }>("POST", `/api/library/${id}/watch-later`, { value }),
+  // --- highlights + notes + clips ---
+  createHighlight: (id: string, start_ms: number, end_ms: number) =>
+    call<Highlight & { error?: string }>("POST", `/api/library/${id}/highlights`, { start_ms, end_ms }),
+  updateHighlightNote: (highlightId: number, note: string | null) =>
+    call<Highlight & { error?: string }>("PATCH", `/api/highlights/${highlightId}`, { note }),
+  deleteHighlight: (highlightId: number) =>
+    call<{ removed?: boolean; error?: string }>("DELETE", `/api/highlights/${highlightId}`),
+  highlights: (contentId?: string, limit = 50, offset = 0, sort = "recent") => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset), sort })
+    if (contentId) qs.set("content_id", contentId)
+    return call<{ items: Highlight[]; total: number }>("GET", `/api/highlights?${qs}`)
+  },
+  createClip: (id: string, b: { start_ms: number; end_ms: number; format: "video" | "audio" }) =>
+    call<{ job_id?: string; status?: string; error?: string }>("POST", `/api/library/${id}/clip`, b),
+  listClips: (id: string) =>
+    call<{ content_id: string; clips: Clip[] }>("GET", `/api/library/${id}/clips`),
+  // --- podcast feeds ---
+  feedsConfig: () => call<FeedsConfig>("GET", "/api/feeds/config"),
+  saveFeedsConfig: (
+    b: Partial<{ enabled: boolean; audio_format: string; bitrate: string }>,
+  ) => call<FeedsConfig>("POST", "/api/feeds/config", b),
+  regenerateFeedsToken: () => call<{ token: string }>("POST", "/api/feeds/token/regenerate"),
+  watchFeedStatus: (watchId: string) =>
+    call<WatchFeedStatus>("GET", `/api/feeds/watch/${watchId}`),
+  feedsBackfill: (watchId?: string) =>
+    call<{ job_id?: string; error?: string }>("POST", "/api/feeds/backfill", { watch_id: watchId }),
   // --- search & index ---
   searchLibrary: (
     q: string,

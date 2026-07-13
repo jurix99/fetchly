@@ -43,6 +43,7 @@ class TJob:
     status: str = "queued"  # queued | running | done | error | canceled
     progress: int = 0
     model: str = "small"
+    engine: str = "local"  # local | cloud (for the discreet cloud icon on jobs)
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     duration_ms: int | None = None
@@ -94,6 +95,7 @@ def public(job: TJob) -> dict[str, Any]:
     return {
         "id": job.id, "content_id": job.content_id, "title": job.title,
         "status": job.status, "progress": job.progress, "model": job.model,
+        "engine": job.engine,
         "created_at": job.created_at, "duration_ms": job.duration_ms, "error": job.error,
     }
 
@@ -339,7 +341,53 @@ def source_captions(path: Path) -> list[dict[str, Any]]:
     return []
 
 
-# --- transcription ---------------------------------------------------------
+# --- Transcriber interface -------------------------------------------------
+# The core step is "produce timestamped segments from a media file". Two
+# implementations sit behind it: local Whisper (default) and cloud STT. The rest
+# of the pipeline (.srt/.vtt, indexing, generation, statuses, the queue) is
+# identical for both — it only ever sees (language, segments).
+def transcribe_media(
+    path: Path,
+    settings: dict[str, Any],
+    on_progress: Any = None,
+    cancel: Any = None,
+) -> tuple[str, list[tuple[int, int, str]]]:
+    if settings.get("engine", "local") == "cloud":
+        from . import cloud_stt
+        return cloud_stt.transcribe_media(path, settings, on_progress=on_progress, cancel=cancel)
+    return _local_transcribe_media(path, settings, on_progress=on_progress, cancel=cancel)
+
+
+def _local_transcribe_media(
+    path: Path, settings: dict[str, Any], on_progress: Any = None, cancel: Any = None,
+) -> tuple[str, list[tuple[int, int, str]]]:
+    """LocalWhisper — the existing faster-whisper path, unchanged in behaviour."""
+    global _last_used
+    model = _load_model(settings.get("model", "small"), settings.get("compute", "auto"))
+    lang_opt = settings.get("language", "auto")
+    language = None if lang_opt == "auto" else lang_opt
+
+    seg_iter, info = model.transcribe(
+        str(path),
+        word_timestamps=True,
+        vad_filter=bool(settings.get("vad_filter", True)),
+        language=language,
+    )
+    detected = getattr(info, "language", "") or ""
+    duration = getattr(info, "duration", 0) or 0
+
+    segs: list[tuple[int, int, str]] = []
+    for seg in seg_iter:
+        if cancel and cancel():
+            raise _Canceled()
+        segs.append((int(seg.start * 1000), int(seg.end * 1000), (seg.text or "").strip()))
+        if duration and on_progress:
+            on_progress(min(99, int(seg.end / duration * 100)))
+        _last_used = time.time()
+    return detected, segs
+
+
+# --- transcription (queue-level: statuses, sidecars, indexing trigger) ------
 def _transcribe(job: TJob, settings: dict[str, Any]) -> tuple[str, int, str]:
     content = db.content_get(job.content_id)
     if not content:
@@ -354,34 +402,26 @@ def _transcribe(job: TJob, settings: dict[str, Any]) -> tuple[str, int, str]:
         return "", 0, "skipped"
 
     db.content_set_transcript(job.content_id, "running")
-    model = _load_model(settings.get("model", "small"), settings.get("compute", "auto"))
-    lang_opt = settings.get("language", "auto")
-    language = None if lang_opt == "auto" else lang_opt
 
-    seg_iter, info = model.transcribe(
-        str(path),
-        word_timestamps=True,
-        vad_filter=bool(settings.get("vad_filter", True)),
-        language=language,
-    )
-    detected = getattr(info, "language", "") or ""
-    duration = content.get("duration_seconds") or getattr(info, "duration", 0) or 0
-
-    segs: list[tuple[int, int, str]] = []
-    for seg in seg_iter:
-        if job.cancel_event.is_set():
-            raise _Canceled()
-        segs.append((int(seg.start * 1000), int(seg.end * 1000), (seg.text or "").strip()))
-        if duration:
-            job.progress = min(99, int(seg.end / duration * 100))
-            _persist_progress(job)
+    def _on_progress(p: int) -> None:
         global _last_used
+        job.progress = min(99, int(p))
+        _persist_progress(job)
         _last_used = time.time()
+
+    detected, segs = transcribe_media(
+        path, settings, on_progress=_on_progress, cancel=job.cancel_event.is_set,
+    )
 
     _write_srt(path.with_suffix(".srt"), segs)
     _write_vtt(path.with_suffix(".vtt"), segs)
     db.segments_replace(job.content_id, segs)
     db.content_set_transcript(job.content_id, "done", language=detected)
+    # Light monthly cost journal for the cloud engine (minutes only, no price).
+    if settings.get("engine") == "cloud":
+        minutes = (content.get("duration_seconds") or 0) / 60
+        if minutes > 0:
+            db.cloud_stt_add_minutes(minutes)
     return detected, len(segs), "done"
 
 
@@ -483,11 +523,13 @@ def enqueue(content_id: str, title: str | None = None, force: bool = False) -> s
         for j in _JOBS.values():
             if j.content_id == content_id and j.status in ("queued", "running"):
                 return j.id  # already queued/running — dedup
+        wsettings = registry.settings_of("whisper")
         job = TJob(
             id=str(uuid.uuid4()),
             content_id=content_id,
             title=title or content.get("title") or "",
-            model=registry.settings_of("whisper").get("model", "small"),
+            model=wsettings.get("model", "small"),
+            engine=wsettings.get("engine", "local"),
             force=force,
         )
         _JOBS[job.id] = job
@@ -533,6 +575,8 @@ def active_count() -> int:
 def status() -> dict[str, Any]:
     settings = registry.settings_of("whisper")
     model = settings.get("model", "small")
+    engine = settings.get("engine", "local")
+    cloud = db.cloud_stt_stats()
     return {
         "enabled": registry.is_enabled("whisper"),
         "device": device_label(),
@@ -542,6 +586,11 @@ def status() -> dict[str, Any]:
         "active": active_count(),
         "schedule": settings.get("schedule", "en continu"),
         "window_open": _window_open(settings),
+        # Cloud engine info for the settings card (default local).
+        "engine": engine,
+        "cloud_preset": settings.get("cloud_preset", ""),
+        "cloud_minutes": cloud.get("minutes", 0),
+        "cloud_month": cloud.get("month", ""),
     }
 
 

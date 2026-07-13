@@ -112,6 +112,7 @@ export interface Subscription {
   lastCheck?: SubscriptionLastCheck | null
   defaultQuality: string
   defaultFormat: string
+  podcastFeed?: boolean
 }
 
 export interface Settings {

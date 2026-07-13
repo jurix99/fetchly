@@ -5,6 +5,203 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.10] - 2026-07-13
+
+Listen anywhere. Each subscription can become a self-hosted **podcast RSS feed**
+(audio) playable in AntennaPod, Overcast, Apple Podcasts, etc. Reliability first:
+audio is prepared **ahead of time** — the media route never transcodes on demand.
+
+### Added
+
+- **OutputPlugin `podcast`** — on each finished download whose subscription has
+  the podcast flag, it prepares the audio rendition: audio content references its
+  own file; video is extracted with ffmpeg (`-vn`, chosen codec) to
+  `/downloads/.fetchly/audio/{content_id}.{ext}` and its size/duration recorded on
+  `contents` (`audio_path`, `audio_bytes`). Best-effort — a failure is logged to
+  `pipeline_runs` and never blocks a download. Settings: global **enabled**,
+  `audio_format` (m4a/AAC default, opus), `bitrate` (64/96/128k). Action
+  **« Préparer l'audio des épisodes existants »** (visible job).
+- **Per-subscription toggle** — a `podcast_feed` flag on the watch, edited via a
+  **Flux podcast** switch in the subscription editor (« Version audio préparée
+  automatiquement pour vos apps de podcast »); if no public URL is set the switch
+  points to the setting.
+- **Feed token** — a random `feeds_token` (generated on first use, regenerable
+  with a destructive confirm — old links break). **Every feed/media URL requires
+  `?token=`**; the token is compared in constant time and never logged.
+- **Routes** — `GET /feeds/{watch_id}.xml` and `GET /feeds/all.xml` (RSS 2.0 +
+  `itunes:` — title/artwork from the watch avatar, up to 100 items newest-first,
+  `itunes:duration`, description = `summary_short` else truncated, `enclosure`
+  with the **exact** length + type, stable `guid` = content_id); `GET
+  /feeds/media/{content_id}.{ext}` serves the prepared audio with **HTTP Range**
+  and an exact `Content-Length` (required by podcast apps), **never** transcoding.
+  All URLs are absolute via `public_base_url`; without it the routes return **409**
+  with a clear message. Management: `GET/POST /api/feeds/config`,
+  `POST /api/feeds/token/regenerate`, `GET /api/feeds/watch/{id}`,
+  `POST /api/feeds/backfill`.
+- **UI** — a subscription card **Flux podcast** popover (full URL with a masked
+  token, copy, revoke note, and a backfill link with a missing-audio counter);
+  a Settings → **Flux podcast** card (global enable, format/bitrate, live stats —
+  active feeds / episodes ready / audio disk usage — the aggregated feed URL, and
+  token regeneration behind a destructive confirm).
+
+### Notes
+
+- Never transcodes on demand: if the audio isn't prepared, the item isn't in the
+  feed and the media route 404s.
+- No feed without a token; regenerating it revokes every previously shared link.
+- Extracted audio creates no `contents` row and is removed by the parent
+  content's delete cascade.
+
+## [0.0.9] - 2026-07-13
+
+Mark what matters. Highlight a transcript passage, pin a note to it, copy a
+sourced citation, or extract the video/audio clip of that moment. These
+attention sensors weight the memory (highlighted passages boost search) and
+produce the first shareable objects.
+
+### Added
+
+- **Highlights** — select text across one or more transcript segments and a
+  floating toolbar appears: **Surligner · Noter · Citer · Clip**. The span rounds
+  to the covered segments and the **verbatim is always rebuilt server-side from
+  transcript_segments** (the DOM selection is never trusted). Highlighted
+  passages get a soft amber background in the transcript (light + dark, AA) and a
+  note icon when annotated. New table `highlights` (cascade-deleted with the
+  content). `POST /api/library/{id}/highlights`, `PATCH/DELETE /api/highlights/{id}`,
+  `GET /api/highlights?content_id=|(all, paginated)`.
+- **Notes** — an inline popover (textarea, Cmd/Ctrl+Enter to save, light delete
+  confirm) on any highlight. Notes are **indexed** (`notes_fts`, accent-insensitive)
+  and fused into search as a typed **`kind: "note"`** result (note + verbatim +
+  timestamp), carrying a "note" badge in the palette and on `/search`. A plain
+  highlight needs no dedicated index (its text is already in `segments_fts`) but
+  **boosts** ranking: a light RRF bonus when a match falls inside a highlight —
+  the memory weighted by attention.
+- **Player markers** — highlights show as thin **amber** spans on the timeline
+  (distinct from the purple chapter markers); click to seek.
+- **Clips** — extract a video (`.mp4`) or audio (`.m4a`) excerpt of a passage
+  via ffmpeg on the existing task queue: editable `m:ss` bounds, 5 min max (413
+  above), 1 s of air before/after, frame-accurate (seek + re-encode; precision
+  over speed for short clips). Output under `/downloads/.fetchly/clips/`, tracked
+  in a `clips` table (they are excerpts — **no `contents` row**). A finished clip
+  toasts a **Télécharger** action and is listed in a **Clips** block on the
+  Aperçu tab. `POST /api/library/{id}/clip`, `GET /api/library/{id}/clips`,
+  `GET /api/clips/{id}/download`. An ffmpeg failure only fails the clip job.
+- **Sourced citations** — client-side, no endpoint: `« {texte} » — {chaîne},
+  « {titre} » ({m:ss})` + a deep link `{public_base_url}/?content={id}&t={s}`
+  (falls back to the current origin with a hint when no public URL is set).
+- **Global « Citations » view** — a **Contenus | Citations** segmented toggle in
+  the Bibliothèque lists every highlight (verbatim, note, clickable source →
+  the exact second, copy button), with a local search and a pedagogical empty
+  state.
+
+### Notes
+
+- No multi-colour highlights/tags (v2), and no hosted public sharing — a clip is
+  downloaded, not published.
+- Deleting a content cascades its highlights, indexed notes and clip files.
+
+## [0.0.8] - 2026-07-13
+
+The founding promise, realized: **follow ~100 channels without noise or misses.**
+The Bibliothèque (already the default route) gains its **Digest** — "since your
+last visit", summaries first, memory resurfacing, and an optional weekly e-mail.
+It's a TiVo, not a feed: strict reverse-chronological, grouped, predictable — no
+opaque ranking anywhere.
+
+### Added
+
+- **Digest section** at the top of the Bibliothèque (above Reprendre / Ajouts
+  récents, which don't move). A lede — *« Depuis votre dernière visite : 8
+  nouveautés · 3 h 40 · 5 chaînes »* — then new content grouped by **day**
+  (Aujourd'hui / Hier / date) and **subscription** (collapsible, avatar + name +
+  count). Each item: compact thumbnail, title, duration, `summary_short` on two
+  lines, and hover/tap actions — Ouvrir, Plus tard (bookmark toggle), Marquer vu.
+  A **Tout marquer comme vu** button clears the section optimistically with a 5 s
+  undo toast (flushed on navigation so it's never silently lost).
+- **« En écho à vos archives »** — for each new, indexed content, the digest
+  reuses `indexer.related()` keeping only **old** contents (> 60 days, score
+  ≥ 0.6) and shows up to 3 deduped *nouveau ↔ ancien* pairs, reusing the fiche's
+  "Ici · Là-bas" language: two clickable timestamps that open each side at the
+  right second. The memory working, made visible but discreet.
+- **« À regarder plus tard »** — a bookmark flag on any content
+  (`POST /api/library/{id}/watch-later`), surfaced in a collapsed, counted
+  section. Persists across visits.
+- **Visit state** — `digest_last_seen_at` setting + `seen_at` / `watch_later`
+  columns on `contents`. Opening a content marks it seen (drops it from the
+  digest). `POST /api/digest/seen { content_ids | all }`, `GET /api/digest`,
+  `GET /api/digest/new-count`. A discreet **new-count badge** on the sidebar's
+  Bibliothèque entry, cleared by "tout marquer vu".
+- **Optional weekly e-mail** — Settings → Digest: enable, day, hour, and a
+  **public base URL** (validated — no e-mail without it, so no dead links). The
+  existing watch scheduler fires it once a week (anti-duplicate guard) as a
+  sober HTML message (text logo, stats, top items per subscription with
+  `summary_short`, deep links to your instance), sent through your configured
+  **Apprise** notification URLs (add a `mailto://`). A **« M'envoyer un aperçu
+  maintenant »** button. No tracking pixels.
+
+### Notes
+
+- Predictability by design: the digest never re-orders by a recommendation
+  score — only reverse-chronological, grouped by day then subscription.
+- No e-mail is sent without a valid `public_base_url`; the transport is whatever
+  Apprise URLs you already configured for notifications.
+- Graceful states: nothing new → a calm *« Vous êtes à jour ✓ »* (never an
+  anxious empty block); a content with no summary (no AI provider) shows without
+  one rather than leaving a hole.
+
+## [0.0.7] - 2026-07-13
+
+Optional **cloud transcription engine**. On a NAS or small server, local Whisper
+is the heavy job; a cloud STT provider turns it into a few HTTP requests. Cloud
+is strictly opt-in — the default stays 100 % local, and no audio leaves the
+machine unless you pick the Cloud engine **and** enter a key.
+
+### Added
+
+- **Transcriber interface** — the core step (produce timestamped segments from a
+  media file) now sits behind `transcribe_media(path, settings) -> (language,
+  segments)` with two implementations: **LocalWhisper** (the existing
+  faster-whisper path, unchanged, default) and **CloudSTT**. The rest of the
+  pipeline — `.srt`/`.vtt` sidecars, search indexing, summary/chapter generation,
+  per-content statuses, the queue and the night window — is byte-for-byte
+  identical for both; it only ever sees `(language, segments)`.
+- **Cloud STT engine** (`app/cloud_stt.py`, stdlib only) — one protocol: the
+  OpenAI-compatible multipart `POST {base}/audio/transcriptions` (OpenAI
+  `whisper-1`/`gpt-4o-transcribe`, Groq `whisper-large-v3-turbo`, Mistral
+  `voxtral-mini-latest`). Audio is always **extracted + downsampled with ffmpeg**
+  (mono, 16 kHz, AAC ~48 kbps) to a temp file first — the video is never
+  uploaded, cutting size 20–50×. If the audio exceeds the provider cap (~25 MB),
+  it's **split into 10-minute slices with 5 s overlap**, sent sequentially, and
+  re-stitched by offsetting timestamps and de-duplicating the overlap by text
+  similarity at the join. `verbose_json` segments are mapped to
+  `transcript_segments` exactly like local; **2 retries with backoff** on 429/5xx,
+  clean actionable error otherwise. Temp audio is always deleted (success or
+  failure).
+- **Whisper plugin settings** — an **Engine** selector (Local | Cloud, default
+  Local) at the top. In Cloud mode: provider preset (OpenAI, Groq, Mistral,
+  Personnalisé) that pre-fills base URL + model, an editable model, and a masked
+  API key. A **Tester la connexion cloud** button (sends 5 s of generated silence
+  and checks the reply) and an **explicit privacy warning** — *« L'audio de vos
+  contenus sera envoyé à {fournisseur}. »* In Local mode: the hardware card
+  (CPU/GPU, measured speed) stays, plus a hint when the measured speed is below
+  real time — *« Matériel modeste détecté — le moteur Cloud peut transcrire
+  beaucoup plus vite. »*
+- **Monthly cost journal** — counts minutes sent to the cloud per month (resets
+  monthly), shown as *« N min transcrites dans le cloud ce mois-ci »*. Minutes
+  only, no price (rates move).
+- **Cloud job indicator** — a discreet cloud icon on cloud transcription jobs in
+  the Transcriptions queue; everything else about the queue is unchanged.
+
+### Notes
+
+- Default is local: no byte leaves the machine unless the user selects Cloud
+  **and** provides a key. This release adds no diarization and no proprietary
+  provider protocol (a single OpenAI-compatible one).
+- The night window ("deferred processing") applies to the cloud engine too, to
+  smooth request bursts if the user wants it.
+- Suggested cloud model IDs are editable defaults (verified July 2026):
+  Groq `whisper-large-v3-turbo`, OpenAI `whisper-1`, Mistral `voxtral-mini-latest`.
+
 ## [0.0.6] - 2026-07-12
 
 First **intelligence** brick — every transcribed content can get an LLM-generated

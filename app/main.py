@@ -24,8 +24,11 @@ from . import db, generate, jobs, library, store, transcribe, watches
 from .plugins.registry import registry
 from .runtime import DOWNLOAD_DIR, WEB_DIR
 from .routes import (
+    annotations,
     content,
+    digest as digest_routes,
     downloads,
+    feeds,
     files,
     generate as generate_routes,
     intelligence,
@@ -47,6 +50,7 @@ app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
 for module in (
     downloads, watches_routes, content, settings, files, system, plugins,
     library_routes, transcripts, search, intelligence, generate_routes,
+    digest_routes, annotations, feeds,
 ):
     app.include_router(module.router)
 

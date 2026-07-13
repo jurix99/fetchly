@@ -104,6 +104,17 @@ class WatchUpdate(BaseModel):
     exclude_shorts: bool | None = None
     exclude_lives: bool | None = None
     filters: SubscriptionFiltersModel | None = None
+    podcast_feed: bool | None = None
+
+
+class FeedsConfigRequest(BaseModel):
+    enabled: bool | None = None
+    audio_format: str | None = None  # m4a | opus
+    bitrate: str | None = None       # 64k | 96k | 128k
+
+
+class FeedsBackfillRequest(BaseModel):
+    watch_id: str | None = None      # None = all podcast-enabled watches
 
 
 class PreviewFiltersRequest(BaseModel):
@@ -124,6 +135,41 @@ class SearchFeedbackRequest(BaseModel):
     `clicked` marks that the search led to opening a result."""
     query_hash: str = ""
     clicked: bool = False
+
+
+class DigestSeenRequest(BaseModel):
+    """Mark contents as seen. `all: true` also advances the visit marker so the
+    digest section empties; otherwise `content_ids` are stamped individually."""
+    content_ids: list[str] | None = None
+    all: bool = False
+
+
+class DigestSettingsRequest(BaseModel):
+    email_enabled: bool | None = None
+    email_day: int | None = None      # 0=Mon … 6=Sun
+    email_hour: int | None = None     # 0-23
+    public_base_url: str | None = None
+
+
+class WatchLaterRequest(BaseModel):
+    value: bool = True
+
+
+class HighlightCreateRequest(BaseModel):
+    """Only the span — the server rebuilds `text` verbatim from transcript_segments
+    (never trusts the DOM selection)."""
+    start_ms: int
+    end_ms: int
+
+
+class HighlightNoteRequest(BaseModel):
+    note: str | None = None
+
+
+class ClipRequest(BaseModel):
+    start_ms: int
+    end_ms: int
+    format: str = "video"  # video | audio
 
 
 class IntelligenceRequest(BaseModel):

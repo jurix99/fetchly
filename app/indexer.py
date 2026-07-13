@@ -50,6 +50,7 @@ MODELS_DIR = store.CONFIG_DIR / "models"
 _RRF_K = 60
 _CHUNK_MS = 45_000
 _OVERLAP_MS = 10_000
+_HL_BONUS = 0.01  # small RRF nudge when a match falls inside a user highlight
 
 _model: Any = None
 _model_lock = threading.Lock()
@@ -357,6 +358,7 @@ def search(
 
     seg_hits = db.fts_segments(tokens, fetch, content_id)
     con_hits = db.fts_contents(tokens, fetch, content_id)
+    note_hits = db.fts_notes(tokens, fetch, content_id)
     sem_hits: list[dict[str, Any]] = []
     if db.VEC_OK and q.strip():
         try:
@@ -365,7 +367,7 @@ def search(
         except Exception as exc:  # noqa: BLE001 — semantic branch never breaks search
             print(f"[indexer] semantic search failed: {exc}", flush=True)
 
-    # RRF fuse the three ranked lists into a per-content score; collect passages.
+    # RRF fuse the ranked lists into a per-content score; collect passages.
     scores: dict[str, float] = {}
     passages: dict[str, list[dict[str, Any]]] = {}
 
@@ -387,8 +389,24 @@ def search(
             "start_ms": h["start_ms"], "text": h["text"], "highlights": [],
             "match_type": "semantic", "score": s,
         })
+    # Notes are a first-class source: a note hit yields a typed passage carrying
+    # the note text + the highlighted verbatim.
+    for rank, h in enumerate(note_hits):
+        s = add(h["content_id"], rank)
+        passages.setdefault(h["content_id"], []).append({
+            "start_ms": h["start_ms"], "text": h["note"], "verbatim": h.get("text") or "",
+            "highlights": [], "match_type": "note", "score": s, "highlight_id": h["highlight_id"],
+        })
     for rank, h in enumerate(con_hits):
         add(h["content_id"], rank)  # metadata boost, no timestamped passage
+
+    # Attention-weighted memory: a light RRF bonus when a content's matched
+    # passages fall inside a user highlight (a plain highlight boosts without a
+    # dedicated index — its text already lives in segments_fts).
+    for cid, ps in passages.items():
+        spans = db.highlights_spans(cid)
+        if spans and any(any(s <= p["start_ms"] < e for s, e in spans) for p in ps):
+            scores[cid] = scores.get(cid, 0.0) + _HL_BONUS
 
     results = []
     for cid in sorted(scores, key=lambda c: scores[c], reverse=True):
@@ -427,9 +445,12 @@ def search(
     }
 
 
+_PTYPE_RANK = {"note": 2, "lexical": 1, "semantic": 0}
+
+
 def _dedupe_passages(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse passages that point at (nearly) the same moment, preferring the
-    lexical one (it carries highlight offsets). Sorted best-score first."""
+    """Collapse passages at (nearly) the same moment, preferring a note, then a
+    lexical (carries highlight offsets), then by score. Sorted best-score first."""
     best: dict[int, dict[str, Any]] = {}
     for p in ps:
         key = int(p["start_ms"] / 1000)  # 1 s bucket
@@ -437,10 +458,8 @@ def _dedupe_passages(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if cur is None:
             best[key] = p
             continue
-        # Prefer lexical (highlights) then higher score.
-        cur_lex = cur["match_type"] == "lexical"
-        p_lex = p["match_type"] == "lexical"
-        if (p_lex and not cur_lex) or (p_lex == cur_lex and p["score"] > cur["score"]):
+        pr, cr = _PTYPE_RANK.get(p["match_type"], 0), _PTYPE_RANK.get(cur["match_type"], 0)
+        if pr > cr or (pr == cr and p["score"] > cur["score"]):
             best[key] = p
     return sorted(best.values(), key=lambda p: p["score"], reverse=True)
 

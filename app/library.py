@@ -38,6 +38,20 @@ def is_within(path: Path | str, root: Path | str) -> bool:
         return False
 
 
+def rebuild_span(content_id: str, start_ms: int, end_ms: int) -> tuple[int, int, str] | None:
+    """Rebuild the verbatim + snapped [start, end] from transcript_segments (the
+    source of truth) for a highlight selection — the DOM text is never trusted.
+    Returns (snapped_start_ms, snapped_end_ms, verbatim) or None if no overlap."""
+    segs = db.segments_get(content_id)
+    covered = [s for s in segs if s["end_ms"] > start_ms and s["start_ms"] < end_ms]
+    if not covered:
+        return None
+    text = " ".join(s["text"].strip() for s in covered if s["text"]).strip()
+    if not text:
+        return None
+    return covered[0]["start_ms"], covered[-1]["end_ms"], text
+
+
 def parse_byte_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
     """Parse an HTTP Range header into a clamped (start, end) inclusive pair, or
     None when there's no//invalid range (caller then serves the whole file).
@@ -110,6 +124,8 @@ def to_public(row: dict[str, Any]) -> dict[str, Any]:
     fp = row.get("filepath")
     d["file_exists"] = bool(fp and Path(fp).exists())
     d["generation_status"] = row.get("generation_status") or "none"
+    d["watch_later"] = bool(row.get("watch_later"))
+    d["seen_at"] = row.get("seen_at")
     try:
         d["chapter_count"] = db.chapters_count(row["id"]) if row.get("id") else 0
     except Exception:  # noqa: BLE001

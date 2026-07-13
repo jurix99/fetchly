@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import db, indexer, library
 from ..runtime import DOWNLOAD_DIR
+from ..schemas import WatchLaterRequest
 
 router = APIRouter()
 
@@ -47,7 +48,18 @@ async def get_content(content_id: str) -> JSONResponse:
     row = db.content_get(content_id)
     if not row:
         return JSONResponse({"error": "Contenu inconnu"}, status_code=404)
+    # Opening a content marks it seen (drops it from the digest).
+    if row.get("seen_at") is None:
+        db.content_mark_seen([content_id])
     return JSONResponse(library.to_public(row))
+
+
+@router.post("/api/library/{content_id}/watch-later")
+async def set_watch_later(content_id: str, req: WatchLaterRequest) -> JSONResponse:
+    if not db.content_get(content_id):
+        return JSONResponse({"error": "Contenu inconnu"}, status_code=404)
+    db.content_set_watch_later(content_id, req.value)
+    return JSONResponse({"id": content_id, "watch_later": req.value})
 
 
 @router.get("/api/library/{content_id}/chapters")
@@ -75,6 +87,25 @@ async def delete_content(content_id: str, delete_file: bool = False) -> JSONResp
     removed_file = False
     if delete_file:
         removed_file = _delete_files(row)
+    # Clip files are excerpts under .fetchly/clips — always removed with the
+    # content (the DB rows cascade in content_delete).
+    for clip in db.clips_get(content_id):
+        try:
+            cp = Path(clip["path"])
+            if cp.exists() and library.is_within(cp, DOWNLOAD_DIR):
+                cp.unlink()
+        except OSError:
+            pass
+    # Prepared podcast audio rendition (under .fetchly/audio), if any.
+    ap = row.get("audio_path")
+    if ap:
+        try:
+            apath = Path(ap)
+            # Only delete extracted renditions we own, never the source media.
+            if apath != Path(row.get("filepath") or "") and apath.exists() and library.is_within(apath, DOWNLOAD_DIR):
+                apath.unlink()
+        except OSError:
+            pass
     db.content_delete(content_id)
     return JSONResponse({"removed": True, "file_removed": removed_file})
 

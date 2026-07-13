@@ -7,14 +7,19 @@ import {
   DownloadIcon,
   ExternalLinkIcon,
   FileTextIcon,
+  HighlighterIcon,
   Loader2Icon,
   PlayIcon,
+  QuoteIcon,
   RotateCcwIcon,
+  ScissorsIcon,
   SearchIcon,
   SparklesIcon,
+  StickyNoteIcon,
   TriangleAlertIcon,
   Trash2Icon,
   WandSparklesIcon,
+  XIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -22,7 +27,9 @@ import { cn } from "@/lib/utils"
 import {
   backend,
   type Chapter,
+  type Clip,
   type Content,
+  type Highlight,
   type RelatedResult,
   type TranscriptDetail,
 } from "@/lib/backend"
@@ -32,6 +39,7 @@ import { useStore } from "@/components/store-provider"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -89,6 +97,10 @@ export function ContentDetailView({
   )
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [providerOn, setProviderOn] = useState<boolean | null>(null)
+  const [highlights, setHighlights] = useState<Highlight[]>([])
+  const [clips, setClips] = useState<Clip[]>([])
+  const [clipBounds, setClipBounds] = useState<{ start_ms: number; end_ms: number } | null>(null)
+  const [publicBase, setPublicBase] = useState("")
   const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null)
   const lastSaved = useRef(0)
 
@@ -121,6 +133,66 @@ export function ContentDetailView({
       alive = false
     }
   }, [contentId])
+
+  // Highlights + clips + the public base URL (for shareable citations).
+  const refreshHighlights = useCallback(() => {
+    backend.highlights(contentId, 200, 0, "position").then((r) => setHighlights(r.items)).catch(() => {})
+  }, [contentId])
+  const refreshClips = useCallback(() => {
+    backend.listClips(contentId).then((r) => setClips(r.clips)).catch(() => {})
+  }, [contentId])
+  useEffect(() => {
+    setHighlights([])
+    setClips([])
+    refreshHighlights()
+    refreshClips()
+    backend.digestSettings().then((s) => setPublicBase(s.public_base_url || "")).catch(() => {})
+  }, [contentId, refreshHighlights, refreshClips])
+
+  const createHighlight = useCallback(
+    async (start_ms: number, end_ms: number): Promise<Highlight | null> => {
+      const hl = await backend.createHighlight(contentId, start_ms, end_ms)
+      if ("error" in hl && hl.error) {
+        toast.error(hl.error)
+        return null
+      }
+      setHighlights((prev) => [...prev, hl as Highlight].sort((a, b) => a.start_ms - b.start_ms))
+      return hl as Highlight
+    },
+    [contentId],
+  )
+  const removeHighlight = useCallback((id: number) => {
+    setHighlights((prev) => prev.filter((h) => h.id !== id))
+    backend.deleteHighlight(id).catch(() => {})
+  }, [])
+  const setHighlightNote = useCallback(async (id: number, note: string) => {
+    const hl = await backend.updateHighlightNote(id, note || null)
+    if (!("error" in hl && hl.error)) {
+      setHighlights((prev) => prev.map((h) => (h.id === id ? (hl as Highlight) : h)))
+    }
+  }, [])
+
+  /** Build a sourced citation and copy it. Uses the public base URL when set,
+   *  else the current origin (with a hint to configure one for sharing). */
+  const copyCitation = useCallback(
+    (start_ms: number, text: string) => {
+      const c = content
+      if (!c) return
+      const sec = Math.floor(start_ms / 1000)
+      const mmss = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`
+      const base = publicBase || (typeof window !== "undefined" ? window.location.origin : "")
+      const link = `${base.replace(/\/$/, "")}/?content=${c.id}&t=${sec}`
+      const citation = `« ${text} » — ${c.channel}, « ${c.title} » (${mmss})\n${link}`
+      navigator.clipboard?.writeText(citation).then(
+        () => {
+          toast.success("Citation copiée")
+          if (!publicBase) toast.info("Configurez l'URL publique (Réglages → Digest) pour des liens partageables.")
+        },
+        () => toast.error("Copie impossible"),
+      )
+    },
+    [content, publicBase],
+  )
 
   // Poll while a summary is being generated, then refresh content + chapters.
   const genStatus = content?.generation_status
@@ -345,6 +417,14 @@ export function ContentDetailView({
         />
       ) : null}
 
+      {highlights.length > 0 && content.duration_seconds ? (
+        <HighlightBar
+          highlights={highlights}
+          durationSec={content.duration_seconds}
+          onSeek={playAt}
+        />
+      ) : null}
+
       {/* Header metadata */}
       <div className="flex flex-col gap-2">
         <div className="flex items-start gap-2">
@@ -410,6 +490,8 @@ export function ContentDetailView({
             <ChaptersList chapters={chapters} currentTime={currentTime} onSeek={playAt} />
           )}
 
+          {clips.length > 0 && <ClipsBlock clips={clips} />}
+
           {/* Original description, secondary to the summary. */}
           {content.description ? (
             <details className="group">
@@ -431,6 +513,12 @@ export function ContentDetailView({
             onPulseDone={clearPulse}
             onSeek={seek}
             onNavigate={onNavigate}
+            highlights={highlights}
+            onCreateHighlight={createHighlight}
+            onRemoveHighlight={removeHighlight}
+            onSetNote={setHighlightNote}
+            onCitation={copyCitation}
+            onOpenClip={(start_ms, end_ms) => setClipBounds({ start_ms, end_ms })}
           />
         </TabsContent>
       </Tabs>
@@ -466,6 +554,15 @@ export function ContentDetailView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {clipBounds && (
+        <ClipDialog
+          contentId={content.id}
+          bounds={clipBounds}
+          onClose={() => setClipBounds(null)}
+          onCreated={refreshClips}
+        />
+      )}
     </div>
   )
 }
@@ -497,6 +594,12 @@ function TranscriptTab({
   onPulseDone,
   onSeek,
   onNavigate,
+  highlights,
+  onCreateHighlight,
+  onRemoveHighlight,
+  onSetNote,
+  onCitation,
+  onOpenClip,
 }: {
   contentId: string
   currentTime: number
@@ -504,6 +607,12 @@ function TranscriptTab({
   onPulseDone: () => void
   onSeek: (seconds: number) => void
   onNavigate: (v: View) => void
+  highlights: Highlight[]
+  onCreateHighlight: (start_ms: number, end_ms: number) => Promise<Highlight | null>
+  onRemoveHighlight: (id: number) => void
+  onSetNote: (id: number, note: string) => void
+  onCitation: (start_ms: number, text: string) => void
+  onOpenClip: (start_ms: number, end_ms: number) => void
 }) {
   const [data, setData] = useState<TranscriptDetail | null>(null)
   const [pluginEnabled, setPluginEnabled] = useState(true)
@@ -511,8 +620,13 @@ function TranscriptTab({
   const [autoScroll, setAutoScroll] = useState(true)
   const [busy, setBusy] = useState(false)
   const [pulseIdx, setPulseIdx] = useState<number | null>(null)
+  // Text selection → floating toolbar; note popover for a clicked highlight.
+  const [sel, setSel] = useState<{ start_ms: number; end_ms: number; text: string; x: number; y: number } | null>(null)
+  const [notePop, setNotePop] = useState<{ highlight: Highlight; x: number; y: number } | null>(null)
   const activeRef = useRef<HTMLButtonElement>(null)
   const pulseRef = useRef<HTMLButtonElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const rowRefs = useRef<Record<number, HTMLElement | null>>({})
 
   const load = useCallback(async () => {
     try {
@@ -569,6 +683,57 @@ function TranscriptTab({
       pulseRef.current?.scrollIntoView({ block: "center", behavior: "smooth" })
     }
   }, [pulseIdx])
+
+  // Map each segment index to the highlight covering it (+ the first segment of
+  // each highlight, where the note affordance is anchored).
+  const segHl = useMemo(() => {
+    const covered: (Highlight | null)[] = segments.map(() => null)
+    const startAt = new Map<number, Highlight>()
+    for (const h of highlights) {
+      let first = -1
+      segments.forEach((s, i) => {
+        if (h.start_ms < s.end_ms && h.end_ms > s.start_ms) {
+          covered[i] = h
+          if (first < 0) first = i
+        }
+      })
+      if (first >= 0) startAt.set(first, h)
+    }
+    return { covered, startAt }
+  }, [segments, highlights])
+
+  /** On mouse/touch release, map the DOM selection to the covered segment span
+   *  and show the contextual toolbar. Never sends the DOM text to the server. */
+  const onSelect = useCallback(() => {
+    const s = window.getSelection?.()
+    if (!s || s.isCollapsed || s.rangeCount === 0) {
+      setSel(null)
+      return
+    }
+    const range = s.getRangeAt(0)
+    if (!listRef.current || !listRef.current.contains(range.commonAncestorContainer)) return
+    const covered: number[] = []
+    for (const [idxStr, el] of Object.entries(rowRefs.current)) {
+      if (el && range.intersectsNode(el)) covered.push(Number(idxStr))
+    }
+    if (covered.length === 0) return
+    const lo = Math.min(...covered)
+    const hi = Math.max(...covered)
+    const text = segments.slice(lo, hi + 1).map((seg) => seg.text.trim()).filter(Boolean).join(" ")
+    const rect = range.getBoundingClientRect()
+    setSel({
+      start_ms: segments[lo].start_ms,
+      end_ms: segments[hi].end_ms,
+      text,
+      x: rect.left + rect.width / 2,
+      y: rect.top,
+    })
+  }, [segments])
+
+  const clearSelection = useCallback(() => {
+    window.getSelection?.()?.removeAllRanges()
+    setSel(null)
+  }, [])
 
   async function transcribe() {
     setBusy(true)
@@ -690,30 +855,248 @@ function TranscriptTab({
         )}
       </div>
 
-      <div className="flex max-h-[55vh] flex-col overflow-y-auto rounded-lg border border-border">
-        {rows.map(({ s, i }) => (
-          <button
-            key={i}
-            ref={(el) => {
-              if (i === activeIdx) activeRef.current = el
-              if (i === pulseIdx) pulseRef.current = el
-            }}
-            type="button"
-            onClick={() => onSeek(s.start_ms / 1000)}
-            className={cn(
-              "flex gap-3 border-b border-border/50 px-3 py-1.5 text-left text-sm transition-colors last:border-0 hover:bg-muted/50",
-              i === activeIdx && "bg-primary/10",
-              i === pulseIdx && "animate-seek-pulse",
-            )}
-          >
-            <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-primary">
-              {fmtMs(s.start_ms)}
-            </span>
-            <span className="text-foreground/90">{highlight(s.text, needle)}</span>
-          </button>
-        ))}
+      <p className="text-[11px] text-muted-foreground">
+        Sélectionnez un passage pour le surligner, l&apos;annoter, le citer ou en extraire un clip.
+      </p>
+
+      <div
+        ref={listRef}
+        onMouseUp={onSelect}
+        onTouchEnd={onSelect}
+        className="flex max-h-[55vh] flex-col overflow-y-auto rounded-lg border border-border"
+      >
+        {rows.map(({ s, i }) => {
+          const hl = segHl.covered[i]
+          const noteAnchor = segHl.startAt.get(i)
+          return (
+            <div
+              key={i}
+              ref={(el) => {
+                rowRefs.current[i] = el
+                if (i === activeIdx) activeRef.current = el as HTMLButtonElement | null
+                if (i === pulseIdx) pulseRef.current = el as HTMLButtonElement | null
+              }}
+              className={cn(
+                "flex items-start gap-2 border-b border-border/50 px-3 py-1.5 text-sm transition-colors last:border-0",
+                i === activeIdx && "bg-primary/10",
+                i === pulseIdx && "animate-seek-pulse",
+                hl && "bg-warning/15 dark:bg-warning/20",
+              )}
+            >
+              {/* Timestamp = the seek control (a real button). */}
+              <button
+                type="button"
+                onClick={() => onSeek(s.start_ms / 1000)}
+                aria-label={`Aller à ${fmtMs(s.start_ms)}`}
+                className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-primary hover:underline"
+              >
+                {fmtMs(s.start_ms)}
+              </button>
+              {/* Text = freely selectable; a plain click (no selection) seeks. */}
+              <span
+                onClick={() => {
+                  const s2 = window.getSelection?.()
+                  if (!s2 || s2.isCollapsed) onSeek(s.start_ms / 1000)
+                }}
+                className="min-w-0 flex-1 cursor-text select-text text-foreground/90"
+              >
+                {highlight(s.text, needle)}
+              </span>
+              {noteAnchor && (
+                <button
+                  type="button"
+                  aria-label={noteAnchor.note ? "Voir la note" : "Ajouter une note"}
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect()
+                    setNotePop({ highlight: noteAnchor, x: r.left, y: r.bottom })
+                  }}
+                  className={cn(
+                    "mt-0.5 shrink-0",
+                    noteAnchor.note ? "text-warning" : "text-muted-foreground/50 hover:text-foreground",
+                  )}
+                >
+                  <StickyNoteIcon className={cn("size-3.5", noteAnchor.note && "fill-warning/30")} />
+                </button>
+              )}
+            </div>
+          )
+        })}
         {rows.length === 0 && (
           <p className="p-3 text-center text-sm text-muted-foreground">Aucun résultat.</p>
+        )}
+      </div>
+
+      {/* Contextual selection toolbar */}
+      {sel && (
+        <SelectionToolbar
+          sel={sel}
+          onHighlight={async () => {
+            await onCreateHighlight(sel.start_ms, sel.end_ms)
+            clearSelection()
+            toast.success("Passage surligné")
+          }}
+          onNote={async () => {
+            const hl = await onCreateHighlight(sel.start_ms, sel.end_ms)
+            clearSelection()
+            if (hl) setNotePop({ highlight: hl, x: sel.x, y: sel.y + 24 })
+          }}
+          onCite={() => {
+            onCitation(sel.start_ms, sel.text)
+            clearSelection()
+          }}
+          onClip={() => {
+            onOpenClip(sel.start_ms, sel.end_ms)
+            clearSelection()
+          }}
+          onDismiss={clearSelection}
+        />
+      )}
+
+      {/* Note popover for a highlight */}
+      {notePop && (
+        <NotePopover
+          highlight={notePop.highlight}
+          x={notePop.x}
+          y={notePop.y}
+          onSave={(note) => {
+            onSetNote(notePop.highlight.id, note)
+            setNotePop(null)
+          }}
+          onDelete={() => {
+            onRemoveHighlight(notePop.highlight.id)
+            setNotePop(null)
+            toast.success("Surlignage supprimé")
+          }}
+          onClose={() => setNotePop(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+/** Floating contextual toolbar shown over a transcript text selection. */
+function SelectionToolbar({
+  sel,
+  onHighlight,
+  onNote,
+  onCite,
+  onClip,
+  onDismiss,
+}: {
+  sel: { x: number; y: number }
+  onHighlight: () => void
+  onNote: () => void
+  onCite: () => void
+  onClip: () => void
+  onDismiss: () => void
+}) {
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest("[data-sel-toolbar]")) onDismiss()
+    }
+    // Defer so the mouseup that created the selection doesn't immediately close it.
+    const t = setTimeout(() => document.addEventListener("mousedown", onDoc), 0)
+    return () => {
+      clearTimeout(t)
+      document.removeEventListener("mousedown", onDoc)
+    }
+  }, [onDismiss])
+
+  const left = Math.max(8, Math.min(sel.x, (typeof window !== "undefined" ? window.innerWidth : 1000) - 8))
+  return (
+    <div
+      data-sel-toolbar
+      style={{ position: "fixed", left, top: Math.max(8, sel.y - 44), transform: "translateX(-50%)", zIndex: 50 }}
+      className="flex items-center gap-0.5 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+    >
+      <ToolbarBtn icon={HighlighterIcon} label="Surligner" onClick={onHighlight} />
+      <ToolbarBtn icon={StickyNoteIcon} label="Noter" onClick={onNote} />
+      <ToolbarBtn icon={QuoteIcon} label="Citer" onClick={onCite} />
+      <ToolbarBtn icon={ScissorsIcon} label="Clip" onClick={onClip} />
+    </div>
+  )
+}
+
+function ToolbarBtn({
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  icon: typeof HighlighterIcon
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-1 rounded px-2 py-1 text-xs font-medium hover:bg-muted"
+    >
+      <Icon className="size-3.5" /> {label}
+    </button>
+  )
+}
+
+/** Inline note editor for a highlight (Cmd/Ctrl+Enter saves; light delete confirm). */
+function NotePopover({
+  highlight,
+  x,
+  y,
+  onSave,
+  onDelete,
+  onClose,
+}: {
+  highlight: Highlight
+  x: number
+  y: number
+  onSave: (note: string) => void
+  onDelete: () => void
+  onClose: () => void
+}) {
+  const [note, setNote] = useState(highlight.note ?? "")
+  const [confirmDel, setConfirmDel] = useState(false)
+  const ref = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    ref.current?.focus()
+    const onDoc = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest("[data-note-pop]")) onClose()
+    }
+    const t = setTimeout(() => document.addEventListener("mousedown", onDoc), 0)
+    return () => {
+      clearTimeout(t)
+      document.removeEventListener("mousedown", onDoc)
+    }
+  }, [onClose])
+
+  const left = Math.max(8, Math.min(x, (typeof window !== "undefined" ? window.innerWidth : 1000) - 320))
+  return (
+    <div
+      data-note-pop
+      style={{ position: "fixed", left, top: y + 6, zIndex: 50, width: 300 }}
+      className="flex flex-col gap-2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg"
+    >
+      <p className="line-clamp-2 text-[11px] italic text-muted-foreground">« {highlight.text} »</p>
+      <textarea
+        ref={ref}
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) onSave(note)
+        }}
+        placeholder="Votre note… (Cmd/Ctrl+Entrée pour enregistrer)"
+        className="min-h-20 w-full resize-none rounded-md border border-border bg-background p-2 text-sm outline-none focus:border-primary"
+      />
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={() => onSave(note)}>Enregistrer</Button>
+        {confirmDel ? (
+          <Button size="sm" variant="destructive" onClick={onDelete}>
+            Confirmer ?
+          </Button>
+        ) : (
+          <Button size="sm" variant="ghost" className="text-destructive" onClick={() => setConfirmDel(true)}>
+            <Trash2Icon className="size-3.5" data-icon="inline-start" /> Supprimer
+          </Button>
         )}
       </div>
     </div>
@@ -1029,5 +1412,186 @@ function ChapterBar({
         )
       })}
     </div>
+  )
+}
+
+/** User highlights as thin amber spans along the timeline (distinct from the
+ *  purple chapter markers). Click seeks to the highlight start. */
+function HighlightBar({
+  highlights,
+  durationSec,
+  onSeek,
+}: {
+  highlights: Highlight[]
+  durationSec: number
+  onSeek: (seconds: number) => void
+}) {
+  return (
+    <div className="relative h-3" aria-label="Surlignages">
+      <div className="absolute inset-x-0 top-1/2 h-0.5 -translate-y-1/2 rounded-full bg-muted" />
+      {highlights.map((h) => {
+        const left = Math.max(0, Math.min(100, (h.start_ms / 1000 / durationSec) * 100))
+        const width = Math.max(0.5, Math.min(100 - left, ((h.end_ms - h.start_ms) / 1000 / durationSec) * 100))
+        return (
+          <button
+            key={h.id}
+            type="button"
+            title={h.note ? `📝 ${h.note}` : h.text}
+            aria-label="Aller au surlignage"
+            onClick={() => onSeek(h.start_ms / 1000)}
+            style={{ left: `${left}%`, width: `${width}%` }}
+            className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full bg-warning/70 transition-colors hover:bg-warning"
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+/** "Clips" block on the Aperçu tab: extracted excerpts with a download link. */
+function ClipsBlock({ clips }: { clips: Clip[] }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <h2 className="flex items-center gap-1.5 text-sm font-semibold">
+        <ScissorsIcon className="size-3.5" /> Clips
+      </h2>
+      <div className="flex flex-col divide-y divide-border/60 overflow-hidden rounded-lg border border-border">
+        {clips.map((c) => (
+          <div key={c.id} className="flex items-center gap-3 px-3 py-2 text-sm">
+            <span className="shrink-0 text-muted-foreground">
+              {c.format === "audio" ? "🎵" : "🎬"}
+            </span>
+            <span className="min-w-0 flex-1 truncate">{c.name}</span>
+            <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+              {fmtMs(c.start_ms)}–{fmtMs(c.end_ms)}
+            </span>
+            <Button size="sm" variant="ghost" render={<a href={c.url} download />}>
+              <DownloadIcon data-icon="inline-start" /> Télécharger
+            </Button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function parseMmss(v: string): number | null {
+  const m = v.trim().match(/^(\d+):([0-5]?\d)$/)
+  if (!m) return null
+  return (Number(m[1]) * 60 + Number(m[2])) * 1000
+}
+
+/** Clip confirmation dialog: editable m:ss bounds, format, then a visible job.
+ *  Polls the job to completion and refreshes the clips list. */
+function ClipDialog({
+  contentId,
+  bounds,
+  onClose,
+  onCreated,
+}: {
+  contentId: string
+  bounds: { start_ms: number; end_ms: number }
+  onClose: () => void
+  onCreated: () => void
+}) {
+  const [startStr, setStartStr] = useState(fmtMs(bounds.start_ms))
+  const [endStr, setEndStr] = useState(fmtMs(bounds.end_ms))
+  const [format, setFormat] = useState<"video" | "audio">("video")
+  const [busy, setBusy] = useState(false)
+
+  const start = parseMmss(startStr)
+  const end = parseMmss(endStr)
+  const durMs = start != null && end != null ? end - start : null
+  const valid = durMs != null && durMs > 0 && durMs <= 5 * 60 * 1000
+
+  async function create() {
+    if (start == null || end == null) return
+    setBusy(true)
+    try {
+      const r = await backend.createClip(contentId, { start_ms: start, end_ms: end, format })
+      if (r.error || !r.job_id) {
+        toast.error(r.error || "Création impossible")
+        setBusy(false)
+        return
+      }
+      const jobId = r.job_id
+      onClose()
+      toast.info("Extraction du clip lancée…")
+      // Poll the task job to completion, then surface a download toast.
+      const started = Date.now()
+      const poll = setInterval(async () => {
+        try {
+          const st = await backend.jobStatus(jobId)
+          if (st.status === "done" || (Date.now() - started > 15 * 60 * 1000)) {
+            clearInterval(poll)
+            onCreated()
+            const clips = await backend.listClips(contentId)
+            const clip = clips.clips[0]
+            if (clip) {
+              toast.success("Clip prêt", {
+                action: { label: "Télécharger", onClick: () => window.open(clip.url, "_blank") },
+                duration: 10000,
+              })
+            }
+          } else if (st.status === "error") {
+            clearInterval(poll)
+            toast.error(st.error || "Échec de l'extraction du clip")
+          }
+        } catch {
+          /* keep polling */
+        }
+      }, 2000)
+    } catch {
+      toast.error("Création impossible")
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>Créer un clip</DialogTitle>
+          <DialogDescription>
+            Extrait vidéo ou audio du passage. Bornes ajustables (m:ss), 5 min max.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-4">
+          <div className="flex items-end gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="clip-start">Début</Label>
+              <Input id="clip-start" value={startStr} onChange={(e) => setStartStr(e.target.value)} className="w-24 font-mono" placeholder="m:ss" />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="clip-end">Fin</Label>
+              <Input id="clip-end" value={endStr} onChange={(e) => setEndStr(e.target.value)} className="w-24 font-mono" placeholder="m:ss" />
+            </div>
+            <p className="pb-2 text-sm text-muted-foreground">
+              {durMs != null && durMs > 0
+                ? `Durée : ${fmtMs(durMs)}`
+                : "Bornes invalides"}
+            </p>
+          </div>
+          {!valid && durMs != null && durMs > 5 * 60 * 1000 && (
+            <p className="text-xs text-destructive">Clip trop long (5 min maximum).</p>
+          )}
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant={format === "video" ? "secondary" : "ghost"} onClick={() => setFormat("video")}>
+              Vidéo (.mp4)
+            </Button>
+            <Button size="sm" variant={format === "audio" ? "secondary" : "ghost"} onClick={() => setFormat("audio")}>
+              Audio (.m4a)
+            </Button>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>Annuler</Button>
+          <Button onClick={create} disabled={!valid || busy}>
+            {busy && <Loader2Icon className="size-4 animate-spin" data-icon="inline-start" />}
+            <ScissorsIcon data-icon="inline-start" /> Créer le clip
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

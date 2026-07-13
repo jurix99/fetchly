@@ -31,7 +31,7 @@ export function Sidebar({
   active: View
   onNavigate: (v: View) => void
 }) {
-  const { activeCount, subscriptions } = useStore()
+  const { activeCount, subscriptions, digestNewCount } = useStore()
   const activeSubs = subscriptions.filter((s) => s.active).length
 
   return (
@@ -70,6 +70,11 @@ export function Sidebar({
               {item.id === "downloads" && activeCount > 0 && (
                 <Badge className="bg-info/20 text-info border-info/30 text-[10px]">
                   {activeCount}
+                </Badge>
+              )}
+              {item.id === "library" && digestNewCount > 0 && (
+                <Badge className="border-primary/30 bg-primary/20 text-[10px] text-primary">
+                  {digestNewCount > 99 ? "99+" : digestNewCount}
                 </Badge>
               )}
             </button>

@@ -90,6 +90,25 @@ def notify_disk_low(free_gb: float, floor_gb: float) -> None:
     ).start()
 
 
+def send_digest_email(subject: str, html_body: str) -> tuple[bool, str]:
+    """Send the weekly digest as HTML through the user's configured Apprise URLs
+    (mailto:// or any service). Synchronous — the caller reports the outcome."""
+    if apprise is None:
+        return False, "Apprise n'est pas installé sur le serveur."
+    cfg = store.get_notifications()
+    urls = [u.strip() for u in cfg.get("urls", []) if u and u.strip()]
+    if not urls:
+        return False, "Aucune URL de notification configurée (ex. mailto://user:pass@smtp…)."
+    ap = _build(urls)
+    if ap is None:
+        return False, "Aucune URL de service valide."
+    try:
+        ok = ap.notify(title=subject, body=html_body, body_format=apprise.NotifyFormat.HTML)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Échec de l'envoi : {exc}"
+    return (True, "E-mail envoyé.") if ok else (False, "L'envoi a échoué — vérifiez vos URLs de service.")
+
+
 def send_test(urls: list[str]) -> tuple[bool, str]:
     """Send a test notification synchronously and report the outcome, so the UI
     can tell the user whether their service URLs actually work."""

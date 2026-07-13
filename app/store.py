@@ -51,12 +51,26 @@ DEFAULTS: dict[str, Any] = {
     "download_archive": False,      # manual downloads skip already-downloaded
     "min_free_gb": 2,               # refuse to start a download below this free space
     "nfo_export": False,            # write Jellyfin/Plex .nfo + poster sidecars
+    # Podcast feeds: a random token gates all feed/media URLs (generated on first
+    # use, regenerable to revoke old links).
+    "feeds": {"token": ""},
     # OPT-IN, default OFF. When true, TLS verification is relaxed *while a model
     # is being downloaded* (Whisper / embeddings) to survive a TLS-intercepting
     # corporate proxy. Leave off unless you are on such a network and trust it —
     # it widens a MITM window for the process during the download. Can also be
     # forced with FETCHLY_INSECURE_MODEL_DOWNLOAD=1.
     "insecure_model_download": False,
+    # "Digest" — the Bibliothèque "since your last visit" section + optional
+    # weekly email. Deferred/state values (last_seen_at, email_last_sent) live
+    # here alongside the user-facing toggles. email_day: 0=Mon … 6=Sun.
+    "digest": {
+        "last_seen_at": "",          # ISO; advanced by "mark all seen"
+        "email_enabled": False,
+        "email_day": 6,              # Sunday
+        "email_hour": 8,             # local hour 0-23
+        "email_last_sent": "",       # ISO date, anti-duplicate guard
+        "public_base_url": "",       # required for e-mail deep links (no dead links)
+    },
     # "Intelligence" — optional LLM provider for summaries + chapters. preset
     # "none" (default) = feature off, zero outbound LLM calls. See app/llm.py for
     # the preset table; base_url/model stay editable after a preset is picked.
@@ -101,6 +115,84 @@ def _write(data: dict[str, Any]) -> None:
 def get_config() -> dict[str, Any]:
     with _LOCK:
         return _read()
+
+
+# --- Public base URL (shared: digest e-mail + podcast feeds) --------------
+def public_base_url() -> str:
+    """The externally reachable base URL of this instance (from digest settings).
+    Required for absolute feed/citation links; empty if not configured."""
+    return (get_digest().get("public_base_url") or "").strip()
+
+
+# --- Podcast feed token ----------------------------------------------------
+def feeds_token() -> str:
+    """The feed access token, generated (and persisted) on first use."""
+    with _LOCK:
+        cfg = _read()
+        feeds = cfg.get("feeds") or {}
+        token = feeds.get("token") or ""
+        if not token:
+            import secrets
+            token = secrets.token_urlsafe(24)
+            cfg["feeds"] = {"token": token}
+            _write(cfg)
+    return token
+
+
+def regenerate_feeds_token() -> str:
+    """Mint a new token — invalidates every previously shared feed URL."""
+    import secrets
+    token = secrets.token_urlsafe(24)
+    with _LOCK:
+        cfg = _read()
+        cfg["feeds"] = {"token": token}
+        _write(cfg)
+    return token
+
+
+# --- Digest settings -------------------------------------------------------
+_DIGEST_KEYS = (
+    "last_seen_at", "email_enabled", "email_day", "email_hour",
+    "email_last_sent", "public_base_url",
+)
+
+
+def get_digest() -> dict[str, Any]:
+    cfg = get_config().get("digest") or {}
+    defaults = DEFAULTS["digest"]
+    return {k: cfg.get(k, defaults[k]) for k in _DIGEST_KEYS}
+
+
+def update_digest(patch: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        cfg = _read()
+        current = cfg.get("digest") or dict(DEFAULTS["digest"])
+        for k, v in (patch or {}).items():
+            if k not in _DIGEST_KEYS:
+                continue
+            if k == "email_enabled":
+                current[k] = bool(v)
+            elif k == "email_day":
+                try:
+                    current[k] = max(0, min(6, int(v)))
+                except (TypeError, ValueError):
+                    current[k] = 6
+            elif k == "email_hour":
+                try:
+                    current[k] = max(0, min(23, int(v)))
+                except (TypeError, ValueError):
+                    current[k] = 8
+            else:
+                current[k] = str(v or "")
+        cfg["digest"] = current
+        _write(cfg)
+    return get_digest()
+
+
+def set_digest_key(key: str, value: Any) -> None:
+    """Set a single digest key (used for state: last_seen_at, email_last_sent)."""
+    if key in _DIGEST_KEYS:
+        update_digest({key: value})
 
 
 # --- Intelligence (LLM) settings ------------------------------------------
@@ -274,6 +366,7 @@ def add_watch(
             "thumbnail": thumbnail,  # known channel avatar (refreshed on sync)
             "enabled": True,
             "backfill": bool(backfill),
+            "podcast_feed": False,  # per-watch podcast RSS toggle
             "seeded": False,
             "synced": 0,
             "total": 0,

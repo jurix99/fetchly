@@ -66,6 +66,22 @@ const TYPE_LABEL = {
   unknown: "Inconnu",
 } as const
 
+// Whisper cloud presets — prefill base_url + model (editable afterwards).
+const STT_PRESETS: Record<string, { cloud_base_url: string; cloud_model: string }> = {
+  openai: { cloud_base_url: "https://api.openai.com/v1", cloud_model: "whisper-1" },
+  groq: { cloud_base_url: "https://api.groq.com/openai/v1", cloud_model: "whisper-large-v3-turbo" },
+  mistral: { cloud_base_url: "https://api.mistral.ai/v1", cloud_model: "voxtral-mini-latest" },
+}
+const WHISPER_LOCAL_FIELDS = new Set(["model", "compute", "vad_filter"])
+const WHISPER_CLOUD_FIELDS = new Set(["cloud_preset", "cloud_base_url", "cloud_model", "cloud_api_key"])
+
+/** Which whisper fields to show for the selected engine (local vs cloud). */
+function whisperFieldVisible(engine: string, key: string): boolean {
+  if (WHISPER_LOCAL_FIELDS.has(key)) return engine !== "cloud"
+  if (WHISPER_CLOUD_FIELDS.has(key)) return engine === "cloud"
+  return true
+}
+
 export function PluginsPanel() {
   const [plugins, setPlugins] = useState<PluginInfo[] | null>(null)
   const [editing, setEditing] = useState<PluginInfo | null>(null)
@@ -297,32 +313,48 @@ function PluginSettingsDialog({
         <div className="flex flex-col gap-4 py-2">
           {plugin?.id === "whisper" && <WhisperStatusCard values={values} />}
 
-          {(plugin?.settings_schema ?? []).map((field, i) => (
-            <div key={field.key}>
-              {i > 0 && <Separator className="mb-4" />}
-              <PluginFieldInput
-                field={field}
-                value={values[field.key]}
-                onChange={(v) => setValues((s) => ({ ...s, [field.key]: v }))}
-              />
-            </div>
-          ))}
-
-          {plugin?.id !== "whisper" && (plugin?.actions ?? []).length > 0 && (
-            <>
-              <Separator />
-              <div className="flex flex-col gap-3">
-                {(plugin?.actions ?? []).map((action) => (
-                  <PluginActionButton
-                    key={action.id}
-                    pluginId={plugin!.id}
-                    action={action}
-                    values={values}
-                  />
-                ))}
+          {(plugin?.settings_schema ?? [])
+            .filter(
+              (field) =>
+                plugin?.id !== "whisper" ||
+                whisperFieldVisible(String(values.engine ?? "local"), field.key),
+            )
+            .map((field, i) => (
+              <div key={field.key}>
+                {i > 0 && <Separator className="mb-4" />}
+                <PluginFieldInput
+                  field={field}
+                  value={values[field.key]}
+                  onChange={(v) =>
+                    setValues((s) => {
+                      // Picking a whisper cloud preset prefills URL + model.
+                      if (plugin?.id === "whisper" && field.key === "cloud_preset") {
+                        const preset = STT_PRESETS[String(v)]
+                        return { ...s, cloud_preset: v, ...(preset ?? {}) }
+                      }
+                      return { ...s, [field.key]: v }
+                    })
+                  }
+                />
               </div>
-            </>
-          )}
+            ))}
+
+          {/* Cloud connection test (whisper, cloud mode) + generic plugin actions. */}
+          {(plugin?.actions ?? [])
+            .filter((a) => {
+              if (plugin?.id !== "whisper") return true
+              // Only the cloud test button here, and only in cloud mode (backfill
+              // lives in the WhisperStatusCard).
+              return a.id === "test_cloud" && String(values.engine ?? "local") === "cloud"
+            })
+            .map((action) => (
+              <PluginActionButton
+                key={action.id}
+                pluginId={plugin!.id}
+                action={action}
+                values={values}
+              />
+            ))}
         </div>
 
         <DialogFooter>
@@ -437,17 +469,50 @@ function WhisperStatusCard({ values }: { values: Record<string, unknown> }) {
   }
 
   const speed = status?.last_speed
+  const engine = String(values.engine ?? status?.engine ?? "local")
+  const cloudMinutes = status?.cloud_minutes ?? 0
+  const provider = String(values.cloud_preset ?? status?.cloud_preset ?? "le fournisseur")
+  // Slow hardware: measured media-minutes-per-real-minute below 1× real time.
+  const slow = engine === "local" && speed != null && parseFloat(speed) > 0 && parseFloat(speed) < 1
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/30 p-3">
-      <div className="grid grid-cols-2 gap-3 text-xs">
-        <Stat label="Matériel détecté" value={status?.device ?? "…"} />
-        <Stat
-          label="Modèle actif"
-          value={status ? `${values.model ?? status.model} ${status.model_size}`.trim() : "…"}
-        />
-        <Stat label="Vitesse mesurée" value={speed ? `~${speed} min de média / min` : "non mesurée"} />
-        <Stat label="Cadence" value={status?.schedule ?? "…"} />
-      </div>
+      {engine === "cloud" ? (
+        <>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <Stat label="Moteur" value="Cloud" />
+            <Stat label="Fournisseur" value={provider} />
+            <Stat label="Modèle" value={String(values.cloud_model ?? "—")} />
+            <Stat label="Ce mois-ci" value={`${cloudMinutes} min transcrites`} />
+          </div>
+          <p className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-2.5 py-1.5 text-xs text-warning">
+            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+            L&apos;audio de vos contenus sera envoyé à {provider}.
+          </p>
+        </>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <Stat label="Matériel détecté" value={status?.device ?? "…"} />
+            <Stat
+              label="Modèle actif"
+              value={status ? `${values.model ?? status.model} ${status.model_size}`.trim() : "…"}
+            />
+            <Stat label="Vitesse mesurée" value={speed ? `~${speed} min de média / min` : "non mesurée"} />
+            <Stat label="Cadence" value={status?.schedule ?? "…"} />
+          </div>
+          {slow && (
+            <p className="rounded-md border border-info/30 bg-info/10 px-2.5 py-1.5 text-xs text-info">
+              Matériel modeste détecté — le moteur Cloud peut transcrire beaucoup plus vite.
+            </p>
+          )}
+          {cloudMinutes > 0 && (
+            <p className="text-xs text-muted-foreground">
+              {cloudMinutes} min transcrites dans le cloud ce mois-ci.
+            </p>
+          )}
+        </>
+      )}
       <Button size="sm" onClick={openConfirm} className="w-fit">
         <SparklesIcon data-icon="inline-start" /> Transcrire toute la bibliothèque
       </Button>
@@ -528,8 +593,10 @@ function PluginActionButton({
   const [fileCount, setFileCount] = useState<number | null>(null)
 
   const isTest = action.kind === "test"
-  // The test button is disabled until a server address is entered.
-  const disabled = busy || (isTest && !String(values.base_url ?? "").trim())
+  // The test button is disabled until a server address is entered (base_url for
+  // generic plugins, cloud_base_url for the whisper cloud engine).
+  const disabled =
+    busy || (isTest && !String(values.base_url ?? values.cloud_base_url ?? "").trim())
 
   async function run() {
     setBusy(true)

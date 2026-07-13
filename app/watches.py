@@ -183,6 +183,12 @@ def _scheduler_loop() -> None:
     while True:
         try:
             _check_disk_alert()
+            # Weekly digest e-mail (optional; fires once in its configured slot).
+            try:
+                from . import digest
+                digest.maybe_send_weekly()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[scheduler] digest e-mail: {exc}", flush=True)
             interval = store.get_settings()["watch_interval_minutes"]
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=interval)
             for watch in store.list_watches():

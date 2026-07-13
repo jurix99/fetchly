@@ -113,6 +113,12 @@ def init() -> None:
         ("summary_model", "TEXT"),
         ("summary_generated_at", "REAL"),
         ("generation_status", "TEXT DEFAULT 'none'"),
+        # Digest (phase 3): visit state + watch-later flag.
+        ("seen_at", "REAL"),
+        ("watch_later", "INTEGER DEFAULT 0"),
+        # Podcast feed: prepared audio rendition (extracted ahead of time).
+        ("audio_path", "TEXT"),
+        ("audio_bytes", "INTEGER"),
     ):
         try:
             _conn.execute(f"ALTER TABLE contents ADD COLUMN {_col} {_decl}")
@@ -139,6 +145,29 @@ def init() -> None:
         """
     )
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_gjobs_status ON generation_jobs(status)")
+    # Highlights (attention capteurs): a span of transcript the user marked, with
+    # an optional note. `text` is the verbatim rebuilt server-side from segments.
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS highlights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_id TEXT, start_ms INTEGER, end_ms INTEGER,
+            text TEXT, note TEXT, color TEXT, created_at REAL
+        )
+        """
+    )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_highlights_content ON highlights(content_id)")
+    # Extracted clips (NOT contents — just files on disk we track for listing/GC).
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clips (
+            id TEXT PRIMARY KEY,
+            content_id TEXT, path TEXT, format TEXT,
+            start_ms INTEGER, end_ms INTEGER, created_at REAL
+        )
+        """
+    )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_clips_content ON clips(content_id)")
     # Dedicated transcription queue (separate from the download pool).
     _conn.execute(
         """
@@ -203,6 +232,13 @@ def _init_search() -> None:
     _conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS contents_fts USING fts5("
         "title, description, channel, content_id UNINDEXED, "
+        "tokenize='unicode61 remove_diacritics 2')"
+    )
+    # Full text over highlight notes (rowid = highlights.id). Synced by the app
+    # (see highlight_set_note / highlight_delete), not by triggers.
+    _conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5("
+        "note, content_id UNINDEXED, start_ms UNINDEXED, "
         "tokenize='unicode61 remove_diacritics 2')"
     )
     # Keep segments_fts in sync with transcript_segments (rowid-linked).
@@ -300,6 +336,41 @@ def meta_set(key: str, value: str) -> None:
         _conn.commit()
 
 
+# --- Cloud STT cost journal (minutes/month, no price) ----------------------
+def _current_month() -> str:
+    return time.strftime("%Y-%m", time.gmtime())
+
+
+def cloud_stt_add_minutes(minutes: float) -> None:
+    """Add transcribed minutes to the current month's counter (auto-resets when
+    the month rolls over). Local-only; no pricing."""
+    if _conn is None or minutes <= 0:
+        return
+    month = _current_month()
+    with _LOCK:
+        row = _conn.execute("SELECT value FROM meta WHERE key = 'cloud_stt_month'").fetchone()
+        cur_row = _conn.execute("SELECT value FROM meta WHERE key = 'cloud_stt_minutes'").fetchone()
+        stored_month = row[0] if row else ""
+        total = (float(cur_row[0]) if cur_row and cur_row[0] else 0.0) if stored_month == month else 0.0
+        total += minutes
+        _conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cloud_stt_month', ?)", (month,))
+        _conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cloud_stt_minutes', ?)", (f"{total:.1f}",))
+        _conn.commit()
+
+
+def cloud_stt_stats() -> dict[str, Any]:
+    """{month, minutes} for the current month (0 if a new month started)."""
+    conn = _reader()
+    if conn is None:
+        return {"month": _current_month(), "minutes": 0}
+    month = _current_month()
+    row = conn.execute("SELECT value FROM meta WHERE key = 'cloud_stt_month'").fetchone()
+    cur = conn.execute("SELECT value FROM meta WHERE key = 'cloud_stt_minutes'").fetchone()
+    if not row or row[0] != month:
+        return {"month": month, "minutes": 0}
+    return {"month": month, "minutes": round(float(cur[0]) if cur and cur[0] else 0.0, 1)}
+
+
 # --- Contents (library) ----------------------------------------------------
 CONTENT_COLUMNS = [
     "id", "source", "source_id", "url", "title", "description", "channel",
@@ -307,13 +378,13 @@ CONTENT_COLUMNS = [
     "filepath", "filesize", "thumbnail_path", "watch_id", "kind",
     "transcript_status", "index_status", "language",
     "summary_short", "summary_long", "summary_model", "summary_generated_at",
-    "generation_status",
+    "generation_status", "seen_at", "watch_later", "audio_path", "audio_bytes",
 ]
 # Processing fields owned by later phases — a re-download/re-scan must not wipe them.
 _CONTENT_PRESERVE = {
     "id", "filepath", "transcript_status", "index_status", "language",
     "summary_short", "summary_long", "summary_model", "summary_generated_at",
-    "generation_status",
+    "generation_status", "seen_at", "watch_later", "audio_path", "audio_bytes",
 }
 _SORTABLE = {"downloaded_at", "title", "duration_seconds"}
 
@@ -393,6 +464,14 @@ def _purge_index_rows(content_id: str) -> None:
     _conn.execute("DELETE FROM transcript_segments WHERE content_id = ?", (content_id,))
     _conn.execute("DELETE FROM related_cache WHERE content_id = ?", (content_id,))
     _conn.execute("DELETE FROM chapters WHERE content_id = ?", (content_id,))
+    # Highlights + their indexed notes, and clip rows (files removed by the route).
+    hl_ids = [r[0] for r in _conn.execute(
+        "SELECT id FROM highlights WHERE content_id = ?", (content_id,)
+    ).fetchall()]
+    for hid in hl_ids:
+        _conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (hid,))
+    _conn.execute("DELETE FROM highlights WHERE content_id = ?", (content_id,))
+    _conn.execute("DELETE FROM clips WHERE content_id = ?", (content_id,))
 
 
 def content_delete(content_id: str) -> str | None:
@@ -604,6 +683,314 @@ def contents_without_summary() -> list[dict[str, Any]]:
         "ORDER BY downloaded_at ASC"
     )
     return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+# --- Digest: visit state + watch-later -------------------------------------
+def content_mark_seen(content_ids: list[str], ts: float | None = None) -> None:
+    if _conn is None or not content_ids:
+        return
+    when = ts if ts is not None else time.time()
+    with _LOCK:
+        _conn.executemany(
+            "UPDATE contents SET seen_at = ? WHERE id = ? AND seen_at IS NULL",
+            [(when, cid) for cid in content_ids],
+        )
+        _conn.commit()
+
+
+def content_set_watch_later(content_id: str, value: bool) -> None:
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute(
+            "UPDATE contents SET watch_later = ? WHERE id = ?", (1 if value else 0, content_id)
+        )
+        _conn.commit()
+
+
+def digest_new(since_ts: float, limit: int = 200) -> list[dict[str, Any]]:
+    """Contents downloaded after `since_ts` and not yet seen — the digest's
+    'since your last visit'. Strict reverse-chronological (no ranking)."""
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents "
+        "WHERE downloaded_at > ? AND seen_at IS NULL "
+        "ORDER BY downloaded_at DESC LIMIT ?",
+        (since_ts, max(1, min(limit, 500))),
+    )
+    return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+def digest_new_count(since_ts: float) -> int:
+    conn = _reader()
+    if conn is None:
+        return 0
+    return conn.execute(
+        "SELECT COUNT(*) FROM contents WHERE downloaded_at > ? AND seen_at IS NULL", (since_ts,)
+    ).fetchone()[0]
+
+
+def watch_later_list(limit: int = 200) -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents "
+        "WHERE watch_later = 1 ORDER BY downloaded_at DESC LIMIT ?",
+        (max(1, min(limit, 500)),),
+    )
+    return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+# --- Highlights + notes (attention capteurs) -------------------------------
+HIGHLIGHT_COLUMNS = ["id", "content_id", "start_ms", "end_ms", "text", "note", "color", "created_at"]
+
+
+def highlight_create(content_id: str, start_ms: int, end_ms: int, text: str, color: str) -> dict[str, Any] | None:
+    if _conn is None:
+        return None
+    with _LOCK:
+        cur = _conn.execute(
+            "INSERT INTO highlights (content_id, start_ms, end_ms, text, note, color, created_at) "
+            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (content_id, start_ms, end_ms, text, color, time.time()),
+        )
+        hid = int(cur.lastrowid)
+        _conn.commit()
+    return highlight_get(hid)
+
+
+def highlight_get(highlight_id: int) -> dict[str, Any] | None:
+    conn = _reader()
+    if conn is None:
+        return None
+    row = conn.execute(
+        f"SELECT {', '.join(HIGHLIGHT_COLUMNS)} FROM highlights WHERE id = ?", (highlight_id,)
+    ).fetchone()
+    return dict(zip(HIGHLIGHT_COLUMNS, row)) if row else None
+
+
+def highlight_set_note(highlight_id: int, note: str | None) -> dict[str, Any] | None:
+    if _conn is None:
+        return None
+    with _LOCK:
+        row = _conn.execute(
+            "SELECT content_id, start_ms FROM highlights WHERE id = ?", (highlight_id,)
+        ).fetchone()
+        if not row:
+            return None
+        _conn.execute("UPDATE highlights SET note = ? WHERE id = ?", (note, highlight_id))
+        # App-synced notes_fts (rowid = highlight id).
+        _conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (highlight_id,))
+        if note and note.strip():
+            _conn.execute(
+                "INSERT INTO notes_fts(rowid, note, content_id, start_ms) VALUES (?, ?, ?, ?)",
+                (highlight_id, note, row[0], row[1]),
+            )
+        _conn.commit()
+    return highlight_get(highlight_id)
+
+
+def highlight_delete(highlight_id: int) -> str | None:
+    """Delete a highlight (+ its indexed note). Returns its content_id or None."""
+    if _conn is None:
+        return None
+    with _LOCK:
+        row = _conn.execute("SELECT content_id FROM highlights WHERE id = ?", (highlight_id,)).fetchone()
+        if not row:
+            return None
+        _conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (highlight_id,))
+        _conn.execute("DELETE FROM highlights WHERE id = ?", (highlight_id,))
+        _conn.commit()
+    return row[0]
+
+
+def _highlight_order(sort: str) -> str:
+    return "start_ms ASC" if sort == "position" else "created_at DESC"
+
+
+def highlights_get(content_id: str, sort: str = "position") -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(HIGHLIGHT_COLUMNS)} FROM highlights WHERE content_id = ? "
+        f"ORDER BY {_highlight_order(sort)}",
+        (content_id,),
+    )
+    return [dict(zip(HIGHLIGHT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+def highlights_all(
+    limit: int = 50, offset: int = 0, sort: str = "recent", content_id: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    conn = _reader()
+    if conn is None:
+        return [], 0
+    where, params = "", []
+    if content_id:
+        where = " WHERE content_id = ?"
+        params.append(content_id)
+    order = "start_ms ASC" if sort == "position" else "created_at DESC"
+    total = conn.execute(f"SELECT COUNT(*) FROM highlights{where}", params).fetchone()[0]
+    cur = conn.execute(
+        f"SELECT {', '.join(HIGHLIGHT_COLUMNS)} FROM highlights{where} "
+        f"ORDER BY {order} LIMIT ? OFFSET ?",
+        [*params, max(1, min(limit, 200)), max(0, offset)],
+    )
+    return [dict(zip(HIGHLIGHT_COLUMNS, r)) for r in cur.fetchall()], total
+
+
+def highlights_spans(content_id: str) -> list[tuple[int, int]]:
+    """(start_ms, end_ms) spans for a content — for the search RRF highlight bonus."""
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute("SELECT start_ms, end_ms FROM highlights WHERE content_id = ?", (content_id,))
+    return [(r[0], r[1]) for r in cur.fetchall()]
+
+
+def fts_notes(tokens: list[str], limit: int, content_id: str | None = None) -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    q = _fts_query(tokens)
+    if not q:
+        return []
+    where = "notes_fts MATCH ?"
+    params: list[Any] = [q]
+    if content_id:
+        where += " AND notes_fts.content_id = ?"
+        params.append(content_id)
+    params.append(limit)
+    try:
+        cur = conn.execute(
+            "SELECT notes_fts.rowid, notes_fts.content_id, notes_fts.start_ms, notes_fts.note, "
+            "highlights.text, bm25(notes_fts) AS rank "
+            "FROM notes_fts JOIN highlights ON highlights.id = notes_fts.rowid "
+            f"WHERE {where} ORDER BY rank LIMIT ?",
+            params,
+        )
+        return [
+            {"highlight_id": r[0], "content_id": r[1], "start_ms": r[2],
+             "note": r[3], "text": r[4], "rank": r[5]}
+            for r in cur.fetchall()
+        ]
+    except Exception:  # noqa: BLE001 — malformed FTS query
+        return []
+
+
+# --- Clips (extracted spans; NOT contents) ---------------------------------
+CLIP_COLUMNS = ["id", "content_id", "path", "format", "start_ms", "end_ms", "created_at"]
+
+
+def clip_create(clip_id: str, content_id: str, path: str, fmt: str, start_ms: int, end_ms: int) -> None:
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute(
+            "INSERT OR REPLACE INTO clips (id, content_id, path, format, start_ms, end_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (clip_id, content_id, path, fmt, start_ms, end_ms, time.time()),
+        )
+        _conn.commit()
+
+
+def clips_get(content_id: str) -> list[dict[str, Any]]:
+    conn = _reader()
+    if conn is None:
+        return []
+    cur = conn.execute(
+        f"SELECT {', '.join(CLIP_COLUMNS)} FROM clips WHERE content_id = ? ORDER BY created_at DESC",
+        (content_id,),
+    )
+    return [dict(zip(CLIP_COLUMNS, r)) for r in cur.fetchall()]
+
+
+def clip_get(clip_id: str) -> dict[str, Any] | None:
+    conn = _reader()
+    if conn is None:
+        return None
+    row = conn.execute(
+        f"SELECT {', '.join(CLIP_COLUMNS)} FROM clips WHERE id = ?", (clip_id,)
+    ).fetchone()
+    return dict(zip(CLIP_COLUMNS, row)) if row else None
+
+
+# --- Podcast audio renditions ----------------------------------------------
+def content_set_audio(content_id: str, audio_path: str, audio_bytes: int) -> None:
+    if _conn is None:
+        return
+    with _LOCK:
+        _conn.execute(
+            "UPDATE contents SET audio_path = ?, audio_bytes = ? WHERE id = ?",
+            (audio_path, audio_bytes, content_id),
+        )
+        _conn.commit()
+
+
+def podcast_items(watch_ids: list[str] | None, limit: int = 100) -> list[dict[str, Any]]:
+    """Contents with a prepared audio rendition, newest first, for a feed. Pass a
+    list of watch_ids to scope (a single-watch feed or the enabled set for 'all');
+    None means any content with audio. Empty list means no items."""
+    conn = _reader()
+    if conn is None:
+        return []
+    where = "audio_path IS NOT NULL AND audio_path != ''"
+    params: list[Any] = []
+    if watch_ids is not None:
+        if not watch_ids:
+            return []
+        where += f" AND watch_id IN ({', '.join('?' for _ in watch_ids)})"
+        params.extend(watch_ids)
+    params.append(max(1, min(limit, 500)))
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE {where} "
+        f"ORDER BY downloaded_at DESC LIMIT ?",
+        params,
+    )
+    return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+def podcast_missing_count(watch_id: str) -> int:
+    """Contents of a watch that don't yet have a prepared audio rendition."""
+    conn = _reader()
+    if conn is None:
+        return 0
+    return conn.execute(
+        "SELECT COUNT(*) FROM contents WHERE watch_id = ? AND (audio_path IS NULL OR audio_path = '')",
+        (watch_id,),
+    ).fetchone()[0]
+
+
+def contents_without_audio(watch_ids: list[str]) -> list[dict[str, Any]]:
+    """Contents of the given watches lacking audio (for the backfill)."""
+    conn = _reader()
+    if conn is None or not watch_ids:
+        return []
+    ph = ", ".join("?" for _ in watch_ids)
+    cur = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents "
+        f"WHERE watch_id IN ({ph}) AND (audio_path IS NULL OR audio_path = '') "
+        "ORDER BY downloaded_at ASC",
+        watch_ids,
+    )
+    return [dict(zip(CONTENT_COLUMNS, r)) for r in cur.fetchall()]
+
+
+def podcast_stats() -> dict[str, Any]:
+    conn = _reader()
+    if conn is None:
+        return {"episodes_ready": 0, "audio_bytes": 0}
+    ready = conn.execute(
+        "SELECT COUNT(*) FROM contents WHERE audio_path IS NOT NULL AND audio_path != ''"
+    ).fetchone()[0]
+    total_bytes = conn.execute(
+        "SELECT COALESCE(SUM(audio_bytes), 0) FROM contents WHERE audio_path IS NOT NULL"
+    ).fetchone()[0]
+    return {"episodes_ready": ready, "audio_bytes": int(total_bytes or 0)}
 
 
 # --- Generation jobs -------------------------------------------------------

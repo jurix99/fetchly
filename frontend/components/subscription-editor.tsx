@@ -78,6 +78,8 @@ export function SubscriptionEditor({
   const [showFilters, setShowFilters] = useState(true)
   const [preview, setPreview] = useState<PreviewFiltersResult | null>(null)
   const [previewing, setPreviewing] = useState(false)
+  const [podcastFeed, setPodcastFeed] = useState(false)
+  const [hasBase, setHasBase] = useState(true)
 
   useEffect(() => {
     if (!subscription) return
@@ -86,7 +88,9 @@ export function SubscriptionEditor({
     setFormat(subscription.defaultFormat)
     setDateAfter(subscription.dateAfter ?? "")
     setFilters(subscription.filters ?? EMPTY_FILTERS)
+    setPodcastFeed(subscription.podcastFeed ?? false)
     setPreview(null)
+    backend.feedsConfig().then((c) => setHasBase(!!c.public_base_url)).catch(() => {})
   }, [subscription])
 
   function patchFilters(p: Partial<SubscriptionFilters>) {
@@ -119,6 +123,7 @@ export function SubscriptionEditor({
       defaultFormat: format,
       dateAfter,
       filters,
+      podcastFeed,
     })
     onOpenChange(false)
   }
@@ -168,6 +173,39 @@ export function SubscriptionEditor({
                 </Button>
               )}
             </div>
+          </div>
+
+          <Separator />
+
+          {/* --- Podcast feed --- */}
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <Label>Flux podcast</Label>
+              <p className="text-xs text-muted-foreground">
+                Version audio préparée automatiquement pour vos apps de podcast.
+                {!hasBase && (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onOpenChange(false)
+                        toast.info("Réglages → Flux podcast : renseignez l'URL publique.")
+                      }}
+                      className="font-medium text-primary hover:underline"
+                    >
+                      URL publique requise
+                    </button>
+                    .
+                  </>
+                )}
+              </p>
+            </div>
+            <Switch
+              checked={podcastFeed}
+              onCheckedChange={setPodcastFeed}
+              aria-label="Flux podcast"
+            />
           </div>
 
           <Separator />

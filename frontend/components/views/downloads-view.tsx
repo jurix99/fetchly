@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react"
 import {
   CheckIcon,
+  CloudIcon,
   DownloadIcon,
   FileTextIcon,
   FolderOpenIcon,
@@ -374,13 +375,18 @@ function TranscriptRow({
           <p className="line-clamp-1 flex-1 text-sm font-medium">
             {job.title || "Transcription"}
           </p>
+          {job.engine === "cloud" && (
+            <CloudIcon className="size-3.5 shrink-0 text-info" aria-label="Transcription cloud" />
+          )}
           <StatusBadge status={T_STATUS[job.status]} />
         </div>
         {job.status === "running" && <Progress value={job.progress} className="mt-1.5" />}
         {job.status === "error" && job.error && (
           <p className="mt-1 line-clamp-1 text-xs text-destructive">{job.error}</p>
         )}
-        <p className="mt-1 text-[11px] text-muted-foreground">Modèle {job.model}</p>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          {job.engine === "cloud" ? "Cloud" : "Local"} · modèle {job.model}
+        </p>
       </div>
       {active && (
         <Button

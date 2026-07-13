@@ -6,6 +6,7 @@ import {
   PlayIcon,
   SearchIcon,
   SparklesIcon,
+  StickyNoteIcon,
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -211,6 +212,8 @@ export function CommandPalette({
                         </span>
                         {p.match_type === "semantic" ? (
                           <SparklesIcon className="mr-1 inline size-3 text-info align-[-1px]" />
+                        ) : p.match_type === "note" ? (
+                          <StickyNoteIcon className="mr-1 inline size-3 text-warning align-[-1px]" />
                         ) : null}
                         <HighlightedText text={p.text} highlights={p.highlights} />
                       </p>

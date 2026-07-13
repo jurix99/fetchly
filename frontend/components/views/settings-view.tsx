@@ -22,6 +22,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { PluginsPanel } from "@/components/plugins-panel"
 import { IndexCard } from "@/components/index-card"
 import { IntelligenceCard } from "@/components/intelligence-card"
+import { DigestCard } from "@/components/digest-card"
+import { FeedsCard } from "@/components/feeds-card"
 
 function Row({
   title,
@@ -199,6 +201,10 @@ export function SettingsView() {
       <IndexCard />
 
       <IntelligenceCard />
+
+      <DigestCard />
+
+      <FeedsCard />
 
       <DiskCard />
 

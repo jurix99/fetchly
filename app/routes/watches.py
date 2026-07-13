@@ -149,6 +149,8 @@ async def update_watch(watch_id: str, req: WatchUpdate) -> JSONResponse:
         fields["exclude_shorts"] = req.exclude_shorts
     if req.exclude_lives is not None:
         fields["exclude_lives"] = req.exclude_lives
+    if req.podcast_feed is not None:
+        fields["podcast_feed"] = req.podcast_feed
     if req.filters is not None:
         f = dict(DEFAULT_FILTERS)
         f.update(req.filters.model_dump())

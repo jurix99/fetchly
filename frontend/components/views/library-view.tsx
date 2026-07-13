@@ -40,6 +40,8 @@ import {
 } from "@/components/ui/tooltip"
 import { SourceBadge } from "@/components/source-badge"
 import { InlineFeedback } from "@/components/inline-feedback"
+import { DigestSection } from "@/components/views/digest-section"
+import { CitationsView } from "@/components/views/citations-view"
 
 const PAGE = 24
 
@@ -79,6 +81,7 @@ export function LibraryView({
   const [kind, setKind] = useState<"all" | "video" | "audio">("all")
   const [transcribed, setTranscribed] = useState<"all" | "yes" | "no">("all")
   const [q, setQ] = useState("")
+  const [tab, setTab] = useState<"contents" | "citations">("contents")
 
   const query = useCallback(
     (offset: number): LibraryQuery => ({
@@ -146,6 +149,34 @@ export function LibraryView({
   return (
     <TooltipProvider>
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 p-4 sm:p-6 lg:p-8">
+        {/* Segmented: browse contents, or all highlights ("Citations"). */}
+        <div className="flex w-fit items-center rounded-lg border border-border p-0.5 text-sm">
+          <button
+            type="button"
+            onClick={() => setTab("contents")}
+            className={cn(
+              "rounded-md px-3 py-1 font-medium transition-colors",
+              tab === "contents" ? "bg-secondary text-secondary-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Contenus
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("citations")}
+            className={cn(
+              "rounded-md px-3 py-1 font-medium transition-colors",
+              tab === "citations" ? "bg-secondary text-secondary-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Citations
+          </button>
+        </div>
+
+        {tab === "citations" ? (
+          <CitationsView onOpen={onOpen} />
+        ) : (
+          <>
         {/* Composable home sections. Phase-3 "Digest" will slot in ABOVE these
             without any refonte — same stacked-section structure. Hidden while
             searching so the query drives the grid. */}
@@ -250,6 +281,8 @@ export function LibraryView({
               {loadingMore ? "Chargement…" : `Charger plus (${total - items.length})`}
             </Button>
           </div>
+        )}
+          </>
         )}
       </div>
     </TooltipProvider>
@@ -381,7 +414,8 @@ function ListRow({ content, onOpen }: { content: Content; onOpen: (id: string) =
 function LibraryHome({ onOpen }: { onOpen: (id: string, startAt?: number) => void }) {
   return (
     <div className="flex flex-col gap-6">
-      {/* Phase 3: <DigestSection /> inserts here, above Reprendre. */}
+      {/* Phase 3: Digest — "since your last visit", above Reprendre. */}
+      <DigestSection onOpen={onOpen} />
       <ResumeSection onOpen={onOpen} />
       <RecentSection onOpen={onOpen} />
     </div>

@@ -46,6 +46,8 @@ interface StoreValue {
   pausedCount: number
   restoredCount: number
   dismissRestored: () => void
+  digestNewCount: number
+  refreshDigestCount: () => void
   activeCount: number
   transcriptJobs: TranscriptJob[]
   transcriptActiveCount: number
@@ -185,6 +187,7 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
       : null,
     defaultQuality: qualityToFrontend(w.quality),
     defaultFormat: "MP4",
+    podcastFeed: w.podcast_feed ?? false,
   }
 }
 
@@ -199,6 +202,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [overrides, setOverrides] = useState<Record<string, DownloadStatus>>({})
   // How many jobs the server resumed after a restart (restoration banner).
   const [restoredCount, setRestoredCount] = useState(0)
+  const [digestNewCount, setDigestNewCount] = useState(0)
   // Local-only settings the backend doesn't persist.
   const [local, setLocal] = useState<Partial<Settings> & { checkIntervalHours?: number }>({
     defaultFormat: "MP4",
@@ -223,6 +227,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [],
   )
   const refreshWatches = useCallback(() => backend.watches().then(setWatches).catch(() => {}), [])
+  const refreshDigestCount = useCallback(
+    () => backend.digestNewCount().then((r) => setDigestNewCount(r.count || 0)).catch(() => {}),
+    [],
+  )
 
   useEffect(() => {
     backend.settings().then(setBset).catch(() => {})
@@ -232,15 +240,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     refreshJobs()
     refreshTranscripts()
     refreshWatches()
+    refreshDigestCount()
     const t1 = setInterval(refreshJobs, 1500)
     const t2 = setInterval(refreshWatches, 8000)
     const t3 = setInterval(refreshTranscripts, 2000)
+    const t4 = setInterval(refreshDigestCount, 60000)
     return () => {
       clearInterval(t1)
       clearInterval(t2)
       clearInterval(t3)
+      clearInterval(t4)
     }
-  }, [refreshJobs, refreshWatches, refreshTranscripts])
+  }, [refreshJobs, refreshWatches, refreshTranscripts, refreshDigestCount])
 
   // Drop an optimistic override once the server's real status matches it (or the
   // job settled into a terminal state), so stale overrides never stick.
@@ -565,6 +576,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const b: Record<string, unknown> = {}
       if (patch.defaultQuality) b.quality = qualityToBackend(patch.defaultQuality)
       if (patch.dateAfter !== undefined) b.date_after = patch.dateAfter
+      if (patch.podcastFeed !== undefined) b.podcast_feed = patch.podcastFeed
       // Send the whole canonical filters object (the editor holds the full set).
       if (patch.filters) b.filters = filtersToBackend(patch.filters)
       const ops: Promise<unknown>[] = []
@@ -628,6 +640,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     pausedCount,
     restoredCount,
     dismissRestored,
+    digestNewCount,
+    refreshDigestCount,
     activeCount,
     transcriptJobs,
     transcriptActiveCount: transcriptJobs.filter(
