@@ -10,6 +10,13 @@ class DownloadRequest(BaseModel):
     quality: str = ""  # empty -> use saved default quality
     format: str = "MP4"
     subfolder: str = ""
+    # Optional extraction metadata (from the paste/preview) so a 'pending' content
+    # card can show a real title/thumbnail before the file lands.
+    title: str = ""
+    thumbnail: str = ""
+    channel: str = ""
+    duration_seconds: float | None = None
+    source: str = ""
 
 
 class ExtractRequest(BaseModel):

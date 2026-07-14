@@ -209,11 +209,17 @@ export interface Content {
   // digest (phase 3)
   seen_at: number | null
   watch_later: boolean
+  // lifecycle (UX refactor): 'pending' until the file lands, then 'ready'
+  lifecycle: ContentLifecycle
+  // live download percent while pending (null once ready)
+  download_progress: number | null
   // added by the API serializer
   thumbnail_url: string | null
   stream_url: string
   file_exists: boolean
 }
+
+export type ContentLifecycle = "pending" | "ready" | "missing"
 
 export type GenerationStatus = "none" | "queued" | "running" | "done" | "error"
 
@@ -459,6 +465,36 @@ export interface RelatedResponse {
   results: RelatedResult[]
 }
 
+// --- content map ("Carte" exploration mode) -------------------------------
+export interface MapNode {
+  content_id: string
+  title: string
+  thumbnail: string | null
+  duration: number | null
+  channel: string
+  score_to_center: number
+  ring: 0 | 1 | 2
+}
+
+export interface MapEdge {
+  a: string
+  b: string
+  score: number
+  pair: {
+    a_start_ms: number | null
+    a_text: string | null
+    b_start_ms: number | null
+    b_text: string | null
+  }
+}
+
+export interface ContentMap {
+  center_id: string
+  depth: 1 | 2
+  nodes: MapNode[]
+  edges: MapEdge[]
+}
+
 export interface SearchMetrics {
   retrievals_week: number
   searches_week: number
@@ -622,8 +658,18 @@ export const backend = {
   jobsRestored: () => call<{ count: number; at: number }>("GET", "/api/jobs/restored"),
   jobStatus: (id: string) =>
     call<{ status?: string; log?: string[]; error?: string }>("GET", `/api/status/${id}`),
-  download: (b: { url: string; quality: string; format: string; subfolder?: string }) =>
-    call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
+  download: (b: {
+    url: string
+    quality: string
+    format: string
+    subfolder?: string
+    // optional preview metadata → seeds a 'pending' Mémoire card immediately
+    title?: string
+    thumbnail?: string
+    channel?: string
+    duration_seconds?: number | null
+    source?: string
+  }) => call<{ job_id?: string; error?: string }>("POST", "/api/download", b),
   pauseJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/pause`),
   resumeJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/resume`),
   cancelJob: (id: string) => call<JobActionResult>("POST", `/api/jobs/${id}/cancel`),
@@ -801,6 +847,9 @@ export const backend = {
   searchMetrics: () => call<SearchMetrics>("GET", "/api/search/metrics"),
   related: (id: string, limit = 5) =>
     call<RelatedResponse>("GET", `/api/library/${id}/related?limit=${limit}`),
+  contentMap: (id: string, depth: 1 | 2 = 1) =>
+    call<ContentMap>("GET", `/api/library/${id}/map?depth=${depth}`),
+  mapStart: () => call<{ content_id: string | null }>("GET", "/api/library/map/start"),
   indexStats: () => call<IndexStats>("GET", "/api/index/stats"),
   indexBackfill: () => call<{ job_id: string }>("POST", "/api/index/backfill"),
   indexRebuild: () => call<{ job_id: string }>("POST", "/api/index/rebuild"),
@@ -832,6 +881,10 @@ export const backend = {
       `/api/plugins/${id}/actions/${action}`,
       body ?? {},
     ),
+  // --- first-transcript "aha" celebration (one-time) ---
+  celebration: () =>
+    call<{ show: boolean; content_id: string | null }>("GET", "/api/system/celebration"),
+  dismissCelebration: () => call<{ ok: boolean }>("POST", "/api/system/celebration/dismiss"),
   cookies: () => call<BackendCookies>("GET", "/api/cookies"),
   saveCookies: (content: string) =>
     call<BackendCookies & { ok: boolean; message: string }>("POST", "/api/cookies", { content }),

@@ -5,12 +5,13 @@ import {
   CheckIcon,
   CircleCheckIcon,
   ClockIcon,
-  CompassIcon,
   FileTextIcon,
   LayoutGridIcon,
   ListIcon,
   Loader2Icon,
+  MapIcon,
   PlayIcon,
+  PlusIcon,
   RefreshCwIcon,
   SearchIcon,
   TriangleAlertIcon,
@@ -19,11 +20,8 @@ import { toast } from "sonner"
 
 import { cn } from "@/lib/utils"
 import { backend, type Content, type LibraryQuery } from "@/lib/backend"
-import { getRecentlyPlayed, type PlaybackEntry } from "@/lib/playback"
-import type { View } from "@/components/app-shell"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Select,
@@ -40,7 +38,8 @@ import {
 } from "@/components/ui/tooltip"
 import { SourceBadge } from "@/components/source-badge"
 import { InlineFeedback } from "@/components/inline-feedback"
-import { DigestSection } from "@/components/views/digest-section"
+import { ContentSteps, isEnriching } from "@/components/content-steps"
+import { MemoryMap } from "@/components/memory-map"
 import { CitationsView } from "@/components/views/citations-view"
 
 const PAGE = 24
@@ -65,23 +64,33 @@ function relativeDate(epoch: number | null): string {
   return `il y a ${Math.floor(d / 365)} an(s)`
 }
 
-export function LibraryView({
+/** Mémoire — the complete library. Contenus | Citations, grid/list (+ a Carte
+ *  mode landing next prompt), sort/filter, processing indicators, and the
+ *  progressive enrichment chips on any still-processing card. */
+export function MemoryView({
   onOpen,
-  onNavigate,
+  onAddSource,
+  mapCenter,
 }: {
   onOpen: (id: string, startAt?: number) => void
-  onNavigate: (v: View) => void
+  onAddSource: (url?: string) => void
+  mapCenter?: string | null
 }) {
   const [items, setItems] = useState<Content[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
-  const [layout, setLayout] = useState<"grid" | "list">("grid")
+  const [mode, setMode] = useState<"grid" | "list" | "map">(mapCenter ? "map" : "grid")
   const [sort, setSort] = useState<NonNullable<LibraryQuery["sort"]>>("downloaded_at")
   const [kind, setKind] = useState<"all" | "video" | "audio">("all")
   const [transcribed, setTranscribed] = useState<"all" | "yes" | "no">("all")
   const [q, setQ] = useState("")
   const [tab, setTab] = useState<"contents" | "citations">("contents")
+
+  // "Ouvrir la carte" (from a fiche) selects the Carte mode centred on a content.
+  useEffect(() => {
+    if (mapCenter) setMode("map")
+  }, [mapCenter])
 
   const query = useCallback(
     (offset: number): LibraryQuery => ({
@@ -110,7 +119,24 @@ export function LibraryView({
     }
   }, [query])
 
-  // Debounce filter/sort changes into a reload.
+  // Silent reload (no skeleton flash): refresh statuses in place and surface any
+  // brand-new pending card at the top — used by polling + the capture grace window.
+  const refresh = useCallback(async () => {
+    try {
+      const page = await backend.library(query(0))
+      setTotal(page.total)
+      setItems((prev) => {
+        if (prev.length <= PAGE) return page.items
+        const byId = new Map(page.items.map((c) => [c.id, c]))
+        const known = new Set(prev.map((c) => c.id))
+        const fresh = page.items.filter((c) => !known.has(c.id))
+        return [...fresh, ...prev.map((c) => byId.get(c.id) ?? c)]
+      })
+    } catch {
+      /* keep prior items */
+    }
+  }, [query])
+
   const first = useRef(true)
   useEffect(() => {
     if (first.current) {
@@ -121,6 +147,24 @@ export function LibraryView({
     const t = setTimeout(load, 250)
     return () => clearTimeout(t)
   }, [load])
+
+  // Capture grace window: a just-captured pending card may land a beat after we
+  // mount — refetch a couple of times so it appears within a few seconds.
+  useEffect(() => {
+    const t1 = setTimeout(refresh, 2000)
+    const t2 = setTimeout(refresh, 5000)
+    return () => {
+      clearTimeout(t1)
+      clearTimeout(t2)
+    }
+  }, [refresh])
+
+  // While anything is still enriching, poll silently so the step-chips advance live.
+  useEffect(() => {
+    if (!items.some(isEnriching)) return
+    const t = setInterval(refresh, 3000)
+    return () => clearInterval(t)
+  }, [items, refresh])
 
   async function loadMore() {
     setLoadingMore(true)
@@ -137,7 +181,7 @@ export function LibraryView({
     try {
       await backend.rescanLibrary()
       toast.success("Analyse de la bibliothèque lancée", {
-        description: "Progression visible dans Téléchargements.",
+        description: "Progression visible dans l'activité.",
       })
     } catch {
       toast.error("Impossible de lancer l'analyse")
@@ -149,7 +193,6 @@ export function LibraryView({
   return (
     <TooltipProvider>
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 p-4 sm:p-6 lg:p-8">
-        {/* Segmented: browse contents, or all highlights ("Citations"). */}
         <div className="flex w-fit items-center rounded-lg border border-border p-0.5 text-sm">
           <button
             type="button"
@@ -177,111 +220,127 @@ export function LibraryView({
           <CitationsView onOpen={onOpen} />
         ) : (
           <>
-        {/* Composable home sections. Phase-3 "Digest" will slot in ABOVE these
-            without any refonte — same stacked-section structure. Hidden while
-            searching so the query drives the grid. */}
-        {q.trim() === "" && <LibraryHome onOpen={onOpen} />}
+            {/* Toolbar */}
+            <div className="flex flex-wrap items-center gap-2">
+              {mode !== "map" && (
+                <>
+                  <div className="relative min-w-48 flex-1">
+                    <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={q}
+                      onChange={(e) => setQ(e.target.value)}
+                      placeholder="Rechercher un titre ou une chaîne…"
+                      className="pl-8"
+                      aria-label="Rechercher dans la bibliothèque"
+                    />
+                  </div>
+                  <Select value={sort} onValueChange={(v) => setSort((v as LibraryQuery["sort"]) ?? "downloaded_at")}>
+                    <SelectTrigger size="sm" className="w-40" aria-label="Trier">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="downloaded_at">Récents</SelectItem>
+                      <SelectItem value="title">Titre (A→Z)</SelectItem>
+                      <SelectItem value="duration_seconds">Durée</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select value={kind} onValueChange={(v) => setKind((v as "all" | "video" | "audio") ?? "all")}>
+                    <SelectTrigger size="sm" className="w-32" aria-label="Type">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">Tous types</SelectItem>
+                      <SelectItem value="video">Vidéo</SelectItem>
+                      <SelectItem value="audio">Audio</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select value={transcribed} onValueChange={(v) => setTranscribed((v as "all" | "yes" | "no") ?? "all")}>
+                    <SelectTrigger size="sm" className="w-36" aria-label="Transcription">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">Transcription</SelectItem>
+                      <SelectItem value="yes">Transcrit</SelectItem>
+                      <SelectItem value="no">Non transcrit</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </>
+              )}
+              {mode === "map" && (
+                <p className="min-w-48 flex-1 text-sm text-muted-foreground">
+                  Les liens entre vos contenus, toujours centrés sur l&apos;un d&apos;eux.
+                </p>
+              )}
+              <div className="flex items-center rounded-lg border border-border">
+                <Button
+                  size="icon-sm"
+                  variant={mode === "grid" ? "secondary" : "ghost"}
+                  onClick={() => setMode("grid")}
+                  aria-label="Vue grille"
+                >
+                  <LayoutGridIcon />
+                </Button>
+                <Button
+                  size="icon-sm"
+                  variant={mode === "list" ? "secondary" : "ghost"}
+                  onClick={() => setMode("list")}
+                  aria-label="Vue liste"
+                >
+                  <ListIcon />
+                </Button>
+                <Button
+                  size="icon-sm"
+                  variant={mode === "map" ? "secondary" : "ghost"}
+                  onClick={() => setMode("map")}
+                  aria-label="Vue carte"
+                >
+                  <MapIcon />
+                </Button>
+              </div>
+              {mode !== "map" && (
+                <Button size="sm" variant="ghost" onClick={rescan}>
+                  <RefreshCwIcon data-icon="inline-start" /> Analyser
+                </Button>
+              )}
+            </div>
 
-        {/* Toolbar */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative flex-1 min-w-48">
-            <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="Rechercher un titre ou une chaîne…"
-              className="pl-8"
-              aria-label="Rechercher dans la bibliothèque"
-            />
-          </div>
-          <Select value={sort} onValueChange={(v) => setSort((v as LibraryQuery["sort"]) ?? "downloaded_at")}>
-            <SelectTrigger size="sm" className="w-40" aria-label="Trier">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="downloaded_at">Récents</SelectItem>
-              <SelectItem value="title">Titre (A→Z)</SelectItem>
-              <SelectItem value="duration_seconds">Durée</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={kind} onValueChange={(v) => setKind((v as "all" | "video" | "audio") ?? "all")}>
-            <SelectTrigger size="sm" className="w-32" aria-label="Type">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">Tous types</SelectItem>
-              <SelectItem value="video">Vidéo</SelectItem>
-              <SelectItem value="audio">Audio</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={transcribed} onValueChange={(v) => setTranscribed((v as "all" | "yes" | "no") ?? "all")}>
-            <SelectTrigger size="sm" className="w-36" aria-label="Transcription">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">Transcription</SelectItem>
-              <SelectItem value="yes">Transcrit</SelectItem>
-              <SelectItem value="no">Non transcrit</SelectItem>
-            </SelectContent>
-          </Select>
-          <div className="flex items-center rounded-lg border border-border">
-            <Button
-              size="icon-sm"
-              variant={layout === "grid" ? "secondary" : "ghost"}
-              onClick={() => setLayout("grid")}
-              aria-label="Vue grille"
-            >
-              <LayoutGridIcon />
-            </Button>
-            <Button
-              size="icon-sm"
-              variant={layout === "list" ? "secondary" : "ghost"}
-              onClick={() => setLayout("list")}
-              aria-label="Vue liste"
-            >
-              <ListIcon />
-            </Button>
-          </div>
-          <Button size="sm" variant="ghost" onClick={rescan}>
-            <RefreshCwIcon data-icon="inline-start" /> Analyser
-          </Button>
-        </div>
+            {mode === "map" ? (
+              <MemoryMap key={mapCenter ?? "start"} initialCenterId={mapCenter ?? null} onOpen={onOpen} />
+            ) : loading ? (
+              <LibrarySkeleton layout={mode === "list" ? "list" : "grid"} />
+            ) : items.length === 0 ? (
+              <InlineFeedback
+                state="empty"
+                icon={PlusIcon}
+                title="Mémoire vide"
+                description="Ajoutez une source — une chaîne, une playlist ou une vidéo — pour commencer à archiver."
+                action={
+                  <Button size="sm" onClick={() => onAddSource()}>
+                    <PlusIcon data-icon="inline-start" /> Ajouter une source
+                  </Button>
+                }
+              />
+            ) : mode === "grid" ? (
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+                {items.map((c) => (
+                  <GridCard key={c.id} content={c} onOpen={onOpen} />
+                ))}
+              </div>
+            ) : (
+              <div className="flex flex-col divide-y divide-border overflow-hidden rounded-lg border border-border">
+                {items.map((c) => (
+                  <ListRow key={c.id} content={c} onOpen={onOpen} />
+                ))}
+              </div>
+            )}
 
-        {loading ? (
-          <LibrarySkeleton layout={layout} />
-        ) : items.length === 0 ? (
-          <InlineFeedback
-            state="empty"
-            icon={CompassIcon}
-            title="Bibliothèque vide"
-            description="Vos téléchargements apparaîtront ici automatiquement."
-            action={
-              <Button size="sm" onClick={() => onNavigate("explorer")}>
-                <CompassIcon data-icon="inline-start" /> Explorer des contenus
-              </Button>
-            }
-          />
-        ) : layout === "grid" ? (
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {items.map((c) => (
-              <GridCard key={c.id} content={c} onOpen={onOpen} />
-            ))}
-          </div>
-        ) : (
-          <div className="flex flex-col divide-y divide-border overflow-hidden rounded-lg border border-border">
-            {items.map((c) => (
-              <ListRow key={c.id} content={c} onOpen={onOpen} />
-            ))}
-          </div>
-        )}
-
-        {!loading && hasMore && (
-          <div className="flex justify-center pt-2">
-            <Button variant="outline" onClick={loadMore} disabled={loadingMore}>
-              {loadingMore ? "Chargement…" : `Charger plus (${total - items.length})`}
-            </Button>
-          </div>
-        )}
+            {mode !== "map" && !loading && hasMore && (
+              <div className="flex justify-center pt-2">
+                <Button variant="outline" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? "Chargement…" : `Charger plus (${total - items.length})`}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -289,7 +348,6 @@ export function LibraryView({
   )
 }
 
-/** Live transcription indicator, driven by transcript_status. */
 const TRANSCRIPT_META: Record<
   string,
   { icon: typeof FileTextIcon; className: string; label: string; spin?: boolean }
@@ -323,7 +381,6 @@ function TranscriptDot({ content }: { content: Content }) {
   )
 }
 
-/** Discreet "chaptered" marker shown on cards when a content has chapters. */
 function ChapteredBadge() {
   return (
     <span
@@ -346,6 +403,12 @@ function Thumb({ content, className }: { content: Content; className?: string })
           <PlayIcon className="size-6" />
         </div>
       )}
+      {content.lifecycle === "pending" && (
+        <span className="absolute inset-0 flex items-center justify-center bg-black/40 text-[10px] font-medium text-white">
+          <Loader2Icon className="mr-1 size-3.5 animate-spin" />
+          {content.download_progress != null ? `${Math.round(content.download_progress)}%` : "…"}
+        </span>
+      )}
       {content.duration_seconds ? (
         <span className="absolute bottom-1 right-1 rounded bg-black/80 px-1 text-[10px] text-white tabular-nums">
           {fmtDuration(content.duration_seconds)}
@@ -356,190 +419,76 @@ function Thumb({ content, className }: { content: Content; className?: string })
 }
 
 function GridCard({ content, onOpen }: { content: Content; onOpen: (id: string) => void }) {
+  const pending = content.lifecycle === "pending"
   return (
     <button
       type="button"
-      onClick={() => onOpen(content.id)}
-      className="group flex flex-col gap-2 rounded-lg border border-transparent p-1 text-left transition-colors hover:bg-muted/50"
+      onClick={() => !pending && onOpen(content.id)}
+      aria-disabled={pending}
+      className={cn(
+        "group flex flex-col gap-2 rounded-lg border border-transparent p-1 text-left transition-colors",
+        pending ? "cursor-default" : "hover:bg-muted/50",
+      )}
     >
       <Thumb content={content} className="aspect-video w-full" />
       <div className="flex flex-col gap-1 px-1 pb-1">
         <p className="line-clamp-2 text-sm font-medium leading-snug">{content.title}</p>
-        {content.summary_short ? (
+        {isEnriching(content) ? (
+          <ContentSteps content={content} className="mt-0.5" />
+        ) : content.summary_short ? (
           <p className="line-clamp-2 text-xs text-muted-foreground">{content.summary_short}</p>
         ) : (
           <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
         )}
-        <div className="mt-0.5 flex items-center gap-2">
-          <SourceBadge source={content.source} className="text-[10px]" />
-          {content.chapter_count > 0 && <ChapteredBadge />}
-          <span className="text-[11px] text-muted-foreground">{relativeDate(content.downloaded_at)}</span>
-          <span className="ml-auto">
-            <TranscriptDot content={content} />
-          </span>
-        </div>
+        {!isEnriching(content) && (
+          <div className="mt-0.5 flex items-center gap-2">
+            <SourceBadge source={content.source} className="text-[10px]" />
+            {content.chapter_count > 0 && <ChapteredBadge />}
+            <span className="text-[11px] text-muted-foreground">{relativeDate(content.downloaded_at)}</span>
+            <span className="ml-auto">
+              <TranscriptDot content={content} />
+            </span>
+          </div>
+        )}
       </div>
     </button>
   )
 }
 
 function ListRow({ content, onOpen }: { content: Content; onOpen: (id: string) => void }) {
+  const pending = content.lifecycle === "pending"
   return (
     <button
       type="button"
-      onClick={() => onOpen(content.id)}
-      className="flex items-center gap-3 p-2 text-left transition-colors hover:bg-muted/50"
+      onClick={() => !pending && onOpen(content.id)}
+      aria-disabled={pending}
+      className={cn(
+        "flex items-center gap-3 p-2 text-left transition-colors",
+        pending ? "cursor-default" : "hover:bg-muted/50",
+      )}
     >
       <Thumb content={content} className="aspect-video w-28 shrink-0" />
       <div className="min-w-0 flex-1">
         <p className="line-clamp-1 text-sm font-medium">{content.title}</p>
-        {content.summary_short ? (
+        {isEnriching(content) ? (
+          <ContentSteps content={content} className="mt-1" />
+        ) : content.summary_short ? (
           <p className="line-clamp-1 text-xs text-muted-foreground">{content.summary_short}</p>
         ) : (
           <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
         )}
       </div>
-      {content.chapter_count > 0 && <ChapteredBadge />}
-      <SourceBadge source={content.source} className="hidden text-[10px] sm:inline-flex" />
-      <span className="hidden w-20 text-right text-[11px] text-muted-foreground sm:block">
-        {relativeDate(content.downloaded_at)}
-      </span>
-      <TranscriptDot content={content} />
+      {!isEnriching(content) && (
+        <>
+          {content.chapter_count > 0 && <ChapteredBadge />}
+          <SourceBadge source={content.source} className="hidden text-[10px] sm:inline-flex" />
+          <span className="hidden w-20 text-right text-[11px] text-muted-foreground sm:block">
+            {relativeDate(content.downloaded_at)}
+          </span>
+          <TranscriptDot content={content} />
+        </>
+      )}
     </button>
-  )
-}
-
-/** Stacked home sections for the Library-as-home. Each block self-hides when it
- *  has nothing to show, so the header stays calm (DESIGN: calme par défaut). */
-function LibraryHome({ onOpen }: { onOpen: (id: string, startAt?: number) => void }) {
-  return (
-    <div className="flex flex-col gap-6">
-      {/* Phase 3: Digest — "since your last visit", above Reprendre. */}
-      <DigestSection onOpen={onOpen} />
-      <ResumeSection onOpen={onOpen} />
-      <RecentSection onOpen={onOpen} />
-    </div>
-  )
-}
-
-/** "Reprendre" — the 3 last-played contents with a remembered position
- *  (localStorage). Resumes exactly where playback stopped. */
-function ResumeSection({ onOpen }: { onOpen: (id: string, startAt?: number) => void }) {
-  const [items, setItems] = useState<{ content: Content; entry: PlaybackEntry }[]>([])
-
-  useEffect(() => {
-    let alive = true
-    const entries = getRecentlyPlayed(3)
-    if (entries.length === 0) {
-      setItems([])
-      return
-    }
-    Promise.all(
-      entries.map((e) =>
-        backend
-          .libraryItem(e.id)
-          .then((c) => (c && !("error" in c && c.error) ? { content: c as Content, entry: e } : null))
-          .catch(() => null),
-      ),
-    ).then((rows) => {
-      if (alive) setItems(rows.filter((r): r is { content: Content; entry: PlaybackEntry } => !!r))
-    })
-    return () => {
-      alive = false
-    }
-  }, [])
-
-  if (items.length === 0) return null
-
-  return (
-    <section className="flex flex-col gap-3">
-      <h2 className="text-sm font-semibold">Reprendre</h2>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        {items.map(({ content, entry }) => (
-          <ResumeCard key={content.id} content={content} entry={entry} onOpen={onOpen} />
-        ))}
-      </div>
-    </section>
-  )
-}
-
-function ResumeCard({
-  content,
-  entry,
-  onOpen,
-}: {
-  content: Content
-  entry: PlaybackEntry
-  onOpen: (id: string, startAt?: number) => void
-}) {
-  const pct = entry.duration > 0 ? Math.min(100, (entry.position / entry.duration) * 100) : 0
-  return (
-    <button
-      type="button"
-      onClick={() => onOpen(content.id, entry.position)}
-      className="group flex gap-3 rounded-xl border border-border bg-card p-2 text-left transition-colors hover:border-primary/40"
-    >
-      <div className="relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg bg-muted">
-        {content.thumbnail_url ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={content.thumbnail_url} alt="" className="size-full object-cover" />
-        ) : (
-          <div className="flex size-full items-center justify-center text-muted-foreground">
-            <PlayIcon className="size-5" />
-          </div>
-        )}
-        <span className="absolute inset-x-0 bottom-0 flex items-center gap-1 bg-black/60 px-1 py-0.5 text-[10px] font-medium text-white">
-          <PlayIcon className="size-2.5" /> {fmtDuration(entry.position)}
-        </span>
-      </div>
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <p className="line-clamp-2 text-sm font-medium leading-snug">{content.title}</p>
-        <p className="truncate text-xs text-muted-foreground">{content.channel}</p>
-        <Progress value={pct} className="mt-auto h-1" />
-      </div>
-    </button>
-  )
-}
-
-/** "Ajouts récents" — everything downloaded in the last 7 days. */
-function RecentSection({ onOpen }: { onOpen: (id: string, startAt?: number) => void }) {
-  const [items, setItems] = useState<Content[] | null>(null)
-
-  useEffect(() => {
-    let alive = true
-    backend
-      .library({ sort: "downloaded_at", order: "desc", limit: 12 })
-      .then((page) => {
-        if (!alive) return
-        const cutoff = Date.now() / 1000 - 7 * 86400
-        setItems(page.items.filter((c) => (c.downloaded_at ?? 0) >= cutoff).slice(0, 8))
-      })
-      .catch(() => alive && setItems([]))
-    return () => {
-      alive = false
-    }
-  }, [])
-
-  if (!items || items.length === 0) return null
-
-  return (
-    <section className="flex flex-col gap-3">
-      <h2 className="text-sm font-semibold">Ajouts récents</h2>
-      <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-1">
-        {items.map((c) => (
-          <button
-            key={c.id}
-            type="button"
-            onClick={() => onOpen(c.id)}
-            className="group flex w-40 shrink-0 flex-col gap-1.5 rounded-lg border border-transparent p-1 text-left transition-colors hover:bg-muted/50"
-          >
-            <Thumb content={c} className="aspect-video w-full" />
-            <p className="line-clamp-2 text-xs font-medium leading-snug">{c.title}</p>
-            <p className="truncate text-[11px] text-muted-foreground">{c.channel}</p>
-          </button>
-        ))}
-      </div>
-    </section>
   )
 }
 

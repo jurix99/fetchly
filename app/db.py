@@ -15,6 +15,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,13 @@ def init() -> None:
         # Podcast feed: prepared audio rendition (extracted ahead of time).
         ("audio_path", "TEXT"),
         ("audio_bytes", "INTEGER"),
+        # Lifecycle (UX refactor): a content row exists from job acceptance.
+        # 'ready' is the default so every pre-existing (already downloaded) row
+        # is ready; new captures start 'pending' and are promoted on completion.
+        # 'missing' = a once-ready file no longer on disk.
+        ("lifecycle", "TEXT DEFAULT 'ready'"),
+        # Download job that produced this row (set while pending, kept after).
+        ("job_id", "TEXT"),
     ):
         try:
             _conn.execute(f"ALTER TABLE contents ADD COLUMN {_col} {_decl}")
@@ -379,12 +387,14 @@ CONTENT_COLUMNS = [
     "transcript_status", "index_status", "language",
     "summary_short", "summary_long", "summary_model", "summary_generated_at",
     "generation_status", "seen_at", "watch_later", "audio_path", "audio_bytes",
+    "lifecycle", "job_id",
 ]
 # Processing fields owned by later phases — a re-download/re-scan must not wipe them.
 _CONTENT_PRESERVE = {
     "id", "filepath", "transcript_status", "index_status", "language",
     "summary_short", "summary_long", "summary_model", "summary_generated_at",
     "generation_status", "seen_at", "watch_later", "audio_path", "audio_bytes",
+    "job_id",
 }
 _SORTABLE = {"downloaded_at", "title", "duration_seconds"}
 
@@ -408,6 +418,110 @@ def content_upsert(row: dict[str, Any]) -> None:
             values,
         )
         _conn.commit()
+
+
+def content_create_pending(job_id: str, meta: dict[str, Any]) -> str | None:
+    """Insert a 'pending' content row from a download's extraction metadata, the
+    moment the job is accepted — so the card appears in Mémoire before the file
+    lands. filepath stays NULL (many NULLs are distinct under the UNIQUE index)
+    until the download completes and content_promote fills it in. Returns the id.
+
+    Idempotent per job: a second call for the same job_id returns the existing
+    pending row instead of duplicating it (a re-queued/restarted job)."""
+    if _conn is None:
+        return None
+    existing = content_by_job(job_id)
+    if existing is not None:
+        return existing["id"]
+    cid = str(uuid.uuid4())
+    row = {c: None for c in CONTENT_COLUMNS}
+    row.update({
+        "id": cid,
+        "source": meta.get("source") or "youtube",
+        "source_id": meta.get("source_id") or "",
+        "url": meta.get("url") or "",
+        "title": meta.get("title") or "Téléchargement en cours…",
+        "description": meta.get("description") or "",
+        "channel": meta.get("channel") or "",
+        "channel_url": meta.get("channel_url") or "",
+        "duration_seconds": meta.get("duration_seconds"),
+        "uploaded_at": meta.get("uploaded_at") or "",
+        "downloaded_at": meta.get("downloaded_at") or time.time(),
+        "filepath": None,
+        "filesize": 0,
+        "thumbnail_path": meta.get("thumbnail_path") or "",
+        "watch_id": meta.get("watch_id"),
+        "kind": meta.get("kind") or "video",
+        "transcript_status": "none",
+        "index_status": "none",
+        "generation_status": "none",
+        "lifecycle": "pending",
+        "job_id": job_id,
+    })
+    cols = ", ".join(CONTENT_COLUMNS)
+    placeholders = ", ".join("?" for _ in CONTENT_COLUMNS)
+    with _LOCK:
+        _conn.execute(
+            f"INSERT INTO contents ({cols}) VALUES ({placeholders})",
+            [row.get(c) for c in CONTENT_COLUMNS],
+        )
+        _conn.commit()
+    return cid
+
+
+def content_by_job(job_id: str) -> dict[str, Any] | None:
+    conn = _reader()
+    if conn is None or not job_id:
+        return None
+    row = conn.execute(
+        f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents WHERE job_id = ? "
+        "ORDER BY downloaded_at DESC LIMIT 1", (job_id,)
+    ).fetchone()
+    return dict(zip(CONTENT_COLUMNS, row)) if row else None
+
+
+def content_promote(job_id: str, updates: dict[str, Any]) -> str | None:
+    """Turn the pending row for `job_id` into a ready one: set its real filepath
+    and freshly extracted metadata, flip lifecycle→'ready'. Returns the row id,
+    or None when there's no pending row (caller then upserts a fresh row)."""
+    if _conn is None:
+        return None
+    row = content_by_job(job_id)
+    if row is None or row.get("lifecycle") != "pending":
+        return None
+    fields = {
+        "filepath": updates.get("filepath"),
+        "filesize": updates.get("filesize") or 0,
+        "lifecycle": "ready",
+    }
+    # Only overwrite metadata when the download supplied a better value.
+    for k in ("title", "source", "source_id", "url", "description", "channel",
+              "channel_url", "duration_seconds", "uploaded_at", "thumbnail_path",
+              "kind", "downloaded_at", "watch_id"):
+        v = updates.get(k)
+        if v not in (None, "", 0):
+            fields[k] = v
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    with _LOCK:
+        _conn.execute(
+            f"UPDATE contents SET {set_clause} WHERE id = ?",
+            [*fields.values(), row["id"]],
+        )
+        _conn.commit()
+    return row["id"]
+
+
+def content_delete_pending(job_id: str) -> bool:
+    """Drop a still-pending row whose job was canceled/failed before producing a
+    file. Never touches a promoted (ready) row."""
+    if _conn is None:
+        return False
+    with _LOCK:
+        cur = _conn.execute(
+            "DELETE FROM contents WHERE job_id = ? AND lifecycle = 'pending'", (job_id,)
+        )
+        _conn.commit()
+        return cur.rowcount > 0
 
 
 def content_get(content_id: str) -> dict[str, Any] | None:
@@ -588,6 +702,26 @@ def content_list(
     return rows, total
 
 
+def map_start_candidates(limit: int = 60, seen_only: bool = False) -> list[str]:
+    """Candidate ids for the Carte's default entry point. `seen_only` = the most
+    recently opened indexed contents (newest first); otherwise recent indexed
+    contents. Pending rows are excluded."""
+    conn = _reader()
+    if conn is None:
+        return []
+    where = ["index_status = 'done'", "(lifecycle IS NULL OR lifecycle != 'pending')"]
+    if seen_only:
+        where.append("seen_at IS NOT NULL")
+        order = "seen_at DESC"
+    else:
+        order = "downloaded_at DESC"
+    cur = conn.execute(
+        f"SELECT id FROM contents WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
+        (max(1, min(limit, 500)),),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
 def contents_without_transcript() -> list[dict[str, Any]]:
     """Content rows whose transcript hasn't been produced (for backfill)."""
     if _conn is None:
@@ -717,6 +851,7 @@ def digest_new(since_ts: float, limit: int = 200) -> list[dict[str, Any]]:
     cur = conn.execute(
         f"SELECT {', '.join(CONTENT_COLUMNS)} FROM contents "
         "WHERE downloaded_at > ? AND seen_at IS NULL "
+        "AND (lifecycle IS NULL OR lifecycle != 'pending') "
         "ORDER BY downloaded_at DESC LIMIT ?",
         (since_ts, max(1, min(limit, 500))),
     )
@@ -728,7 +863,8 @@ def digest_new_count(since_ts: float) -> int:
     if conn is None:
         return 0
     return conn.execute(
-        "SELECT COUNT(*) FROM contents WHERE downloaded_at > ? AND seen_at IS NULL", (since_ts,)
+        "SELECT COUNT(*) FROM contents WHERE downloaded_at > ? AND seen_at IS NULL "
+        "AND (lifecycle IS NULL OR lifecycle != 'pending')", (since_ts,)
     ).fetchone()[0]
 
 

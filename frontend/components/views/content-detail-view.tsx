@@ -9,6 +9,7 @@ import {
   FileTextIcon,
   HighlighterIcon,
   Loader2Icon,
+  NetworkIcon,
   PlayIcon,
   QuoteIcon,
   RotateCcwIcon,
@@ -34,7 +35,8 @@ import {
   type TranscriptDetail,
 } from "@/lib/backend"
 import { savePlaybackPosition } from "@/lib/playback"
-import type { View } from "@/components/app-shell"
+import type { Celebration, View } from "@/components/app-shell"
+import { AhaCallout } from "@/components/aha-callout"
 import { useStore } from "@/components/store-provider"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -74,12 +76,20 @@ export function ContentDetailView({
   onBack,
   onNavigate,
   onOpenContent,
+  celebration,
+  onDismissCelebration,
+  onOpenPalette,
+  onOpenMap,
 }: {
   contentId: string
   startAt?: number
   onBack: () => void
   onNavigate: (v: View) => void
   onOpenContent: (id: string, startAt?: number, queryHash?: string) => void
+  celebration?: Celebration
+  onDismissCelebration?: () => void
+  onOpenPalette?: () => void
+  onOpenMap?: (id: string) => void
 }) {
   const { addDownload, settings } = useStore()
   const [content, setContent] = useState<Content | null>(null)
@@ -358,9 +368,14 @@ export function ContentDetailView({
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 p-4 sm:p-6 lg:p-8">
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="sm" onClick={onBack}>
-          <ArrowLeftIcon data-icon="inline-start" /> Bibliothèque
+          <ArrowLeftIcon data-icon="inline-start" /> Mémoire
         </Button>
       </div>
+
+      {/* First-transcript "aha" — shown on the very content that triggered it. */}
+      {celebration?.show && celebration.contentId === contentId && onOpenPalette && onDismissCelebration && (
+        <AhaCallout onOpenPalette={onOpenPalette} onDismiss={onDismissCelebration} />
+      )}
 
       {/* Player */}
       {missing ? (
@@ -524,7 +539,7 @@ export function ContentDetailView({
       </Tabs>
 
       {/* First crossing of the memory: other contents in the user's library. */}
-      <RelatedSection contentId={content.id} onSeek={seek} onOpenContent={onOpenContent} />
+      <RelatedSection contentId={content.id} onSeek={seek} onOpenContent={onOpenContent} onOpenMap={onOpenMap} />
 
       <Separator />
 
@@ -1110,10 +1125,12 @@ function RelatedSection({
   contentId,
   onSeek,
   onOpenContent,
+  onOpenMap,
 }: {
   contentId: string
   onSeek: (seconds: number) => void
   onOpenContent: (id: string, startAt?: number) => void
+  onOpenMap?: (id: string) => void
 }) {
   const [results, setResults] = useState<RelatedResult[] | null>(null)
 
@@ -1135,7 +1152,14 @@ function RelatedSection({
 
   return (
     <div className="flex flex-col gap-3">
-      <h2 className="text-sm font-semibold">Dans votre bibliothèque</h2>
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">Dans votre bibliothèque</h2>
+        {onOpenMap && (
+          <Button size="sm" variant="ghost" onClick={() => onOpenMap(contentId)}>
+            <NetworkIcon data-icon="inline-start" /> Ouvrir la carte
+          </Button>
+        )}
+      </div>
 
       {bridge?.pair && (
         <div className="flex flex-col gap-2 rounded-xl border border-border bg-muted/30 p-3">

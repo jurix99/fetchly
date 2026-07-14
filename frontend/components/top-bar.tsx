@@ -3,17 +3,16 @@
 import { useEffect, useState } from "react"
 import {
   ActivityIcon,
-  CompassIcon,
-  DownloadIcon,
-  GaugeIcon,
-  HomeIcon,
   LibraryIcon,
   MenuIcon,
-  RssIcon,
+  PlusIcon,
+  RadioTowerIcon,
   SearchIcon,
   SettingsIcon,
+  SunriseIcon,
 } from "lucide-react"
 
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -28,21 +27,17 @@ import { useStore } from "@/components/store-provider"
 import type { View } from "@/components/app-shell"
 
 const TITLES: Record<View, string> = {
-  home: "Accueil",
-  library: "Bibliothèque",
+  today: "Aujourd'hui",
+  memory: "Mémoire",
+  sources: "Sources",
   search: "Recherche",
-  explorer: "Explorer",
-  subscriptions: "Abonnements",
-  downloads: "Téléchargements",
   settings: "Réglages",
 }
 
-const MOBILE_NAV: { id: View; label: string; icon: typeof HomeIcon }[] = [
-  { id: "home", label: "Accueil", icon: HomeIcon },
-  { id: "library", label: "Bibliothèque", icon: LibraryIcon },
-  { id: "explorer", label: "Explorer", icon: CompassIcon },
-  { id: "subscriptions", label: "Abonnements", icon: RssIcon },
-  { id: "downloads", label: "Téléchargements", icon: DownloadIcon },
+const MOBILE_NAV: { id: View; label: string; icon: typeof SunriseIcon }[] = [
+  { id: "today", label: "Aujourd'hui", icon: SunriseIcon },
+  { id: "memory", label: "Mémoire", icon: LibraryIcon },
+  { id: "sources", label: "Sources", icon: RadioTowerIcon },
   { id: "settings", label: "Réglages", icon: SettingsIcon },
 ]
 
@@ -50,12 +45,16 @@ export function TopBar({
   active,
   onNavigate,
   onOpenSearch,
+  onOpenTray,
+  onAddSource,
 }: {
   active: View
   onNavigate: (v: View) => void
   onOpenSearch: () => void
+  onOpenTray: () => void
+  onAddSource: () => void
 }) {
-  const { activeCount, totalSpeed } = useStore()
+  const { activeTotal, globalPaused, errorCount } = useStore()
   const [isMac, setIsMac] = useState(false)
 
   useEffect(() => {
@@ -104,7 +103,7 @@ export function TopBar({
         </kbd>
       </button>
 
-      <div className="ml-auto flex items-center gap-2 sm:ml-0">
+      <div className="ml-auto flex items-center gap-1.5 sm:ml-0">
         {/* Compact search trigger on narrow screens. */}
         <Button
           variant="ghost"
@@ -115,15 +114,38 @@ export function TopBar({
         >
           <SearchIcon />
         </Button>
-        <div className="hidden items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs sm:flex">
-          <ActivityIcon className="size-3.5 text-info" />
-          <span className="font-medium tabular-nums">{activeCount}</span>
-          <span className="text-muted-foreground">actifs</span>
-        </div>
-        <div className="hidden items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs sm:flex">
-          <GaugeIcon className="size-3.5 text-success" />
-          <span className="font-medium tabular-nums">{totalSpeed}</span>
-        </div>
+
+        {/* Omnipresent capture — the gesture, not a place. */}
+        <Button size="sm" onClick={onAddSource} aria-label="Ajouter une source">
+          <PlusIcon data-icon="inline-start" />
+          <span className="hidden sm:inline">Ajouter</span>
+        </Button>
+
+        {/* Activity tray — the plumbing is consulted, not inhabited. Discreet when
+            calm; amber if globally paused; red when there are unseen errors. */}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onOpenTray}
+          aria-label={`Activité${activeTotal ? ` — ${activeTotal} en cours` : ""}`}
+          className="relative"
+        >
+          <ActivityIcon
+            className={cn(activeTotal > 0 ? "text-info" : "text-muted-foreground")}
+          />
+          {activeTotal > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-info px-1 text-[10px] font-semibold tabular-nums text-background">
+              {activeTotal > 99 ? "99+" : activeTotal}
+            </span>
+          )}
+          {errorCount > 0 && (
+            <span className="absolute right-0 top-0 size-2 rounded-full bg-destructive ring-2 ring-background" />
+          )}
+          {activeTotal === 0 && errorCount === 0 && globalPaused && (
+            <span className="absolute right-0 top-0 size-2 rounded-full bg-warning ring-2 ring-background" />
+          )}
+        </Button>
+
         <Separator orientation="vertical" className="hidden h-5 sm:block" />
         <ThemeToggle />
       </div>

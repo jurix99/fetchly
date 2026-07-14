@@ -139,11 +139,11 @@ export function DownloadsView({ onNavigate }: { onNavigate?: (v: View) => void }
           state="empty"
           icon={DownloadIcon}
           title="Aucun téléchargement"
-          description="Collez une URL depuis l'accueil pour lancer un téléchargement."
+          description="Ajoutez une source pour lancer un téléchargement."
           action={
             onNavigate ? (
-              <Button size="sm" onClick={() => onNavigate("home")}>
-                <DownloadIcon data-icon="inline-start" /> Nouveau téléchargement
+              <Button size="sm" onClick={() => onNavigate("today")}>
+                <DownloadIcon data-icon="inline-start" /> Retour à l'accueil
               </Button>
             ) : undefined
           }

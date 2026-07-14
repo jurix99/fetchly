@@ -169,9 +169,11 @@ export interface StartDownloadOptions {
   quality: string
   format: string
   channel?: string
+  durationSeconds?: number | null
 }
 
-/** Lance un téléchargement réel via le backend. */
+/** Lance un téléchargement réel via le backend. Les métadonnées d'aperçu (titre,
+ *  miniature…) alimentent une carte « pending » visible immédiatement dans Mémoire. */
 export async function startDownload(
   options: StartDownloadOptions,
 ): Promise<{ job_id?: string; error?: string }> {
@@ -179,6 +181,11 @@ export async function startDownload(
     url: options.url,
     quality: qualityToBackend(options.quality),
     format: options.format,
+    title: options.title,
+    thumbnail: options.thumbnail,
+    channel: options.channel,
+    duration_seconds: options.durationSeconds ?? null,
+    source: options.channel ? detectSource(options.url) : undefined,
   })
 }
 

@@ -7,6 +7,7 @@ import {
   CopyIcon,
   ListFilterIcon,
   ListVideoIcon,
+  PlusIcon,
   PodcastIcon,
   RefreshCwIcon,
   SettingsIcon,
@@ -58,7 +59,7 @@ function timeAgo(iso: string) {
   return `il y a ${Math.floor(h / 24)} j`
 }
 
-export function SubscriptionsPanel() {
+export function SubscriptionsPanel({ onAddSource }: { onAddSource?: (url?: string) => void } = {}) {
   const {
     subscriptions,
     watchProgress,
@@ -92,8 +93,15 @@ export function SubscriptionsPanel() {
       <InlineFeedback
         state="empty"
         icon={BellIcon}
-        title="Aucun abonnement"
-        description="Suivez une chaîne ou une playlist depuis l'onglet Explorer pour télécharger automatiquement les nouvelles vidéos."
+        title="Aucune source"
+        description="Ajoutez une chaîne ou une playlist pour télécharger automatiquement les nouvelles vidéos."
+        action={
+          onAddSource ? (
+            <Button size="sm" onClick={() => onAddSource()}>
+              <PlusIcon data-icon="inline-start" /> Ajouter une source
+            </Button>
+          ) : undefined
+        }
       />
     )
   }

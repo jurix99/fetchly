@@ -31,6 +31,13 @@ _PERIOD_DAYS = {"week": 7, "month": 30, "quarter": 90, "year": 365}
 _REL_KNN = 25           # neighbours fetched per source chunk
 _REL_TOP_PAIRS = 3      # average of the N best chunk-pair similarities per candidate
 _REL_MIN_SCORE = 0.55   # cosine-similarity floor below which a link isn't shown
+_REL_CACHE_MAX = 25     # cache the top-N links (sliced to `limit` on read) so the
+                        # cache is limit-independent — the map needs more than the
+                        # related-panel's 5.
+
+# Content-map tuning (the "Carte" exploration mode — always centred on one node).
+_MAP_MAX_D1 = 12        # direct neighbours at depth 1
+_MAP_MAX_TOTAL = 25     # hard cap on total nodes at depth 2
 
 # Preferred 384-dim ONNX embedders (no torch — the actual constraint), best
 # first. intfloat/multilingual-e5-small is markedly stronger for French
@@ -216,7 +223,8 @@ def related(content_id: str, limit: int = 5) -> dict[str, Any]:
     cached = db.related_cache_get(content_id, version)
     if cached is not None:
         try:
-            return json.loads(cached)
+            full = json.loads(cached)
+            return {**full, "results": full.get("results", [])[:limit]}
         except (TypeError, json.JSONDecodeError):
             pass
 
@@ -264,7 +272,7 @@ def related(content_id: str, limit: int = 5) -> dict[str, Any]:
 
     scored.sort(key=lambda x: x[0], reverse=True)
     results = []
-    for mean, cid, best in scored[:limit]:
+    for mean, cid, best in scored[:_REL_CACHE_MAX]:
         card = _content_card(cid)
         if not card:
             continue
@@ -278,9 +286,105 @@ def related(content_id: str, limit: int = 5) -> dict[str, Any]:
             }
         results.append(item)
 
+    # Cache the full top-N (limit-independent); callers slice to their own limit.
     payload = {"content_id": content_id, "results": results}
     db.related_cache_set(content_id, version, json.dumps(payload))
-    return payload
+    return {"content_id": content_id, "results": results[:limit]}
+
+
+def content_map(content_id: str, depth: int = 1) -> dict[str, Any]:
+    """The "Carte" data: a graph ALWAYS centred on `content_id`. Depth 1 = the
+    focal node + its direct links (≤12); depth 2 also pulls the links-of-links
+    (≤25 nodes total). Edges include neighbour↔neighbour links (not only to the
+    centre) above the score floor — that's what reveals clusters. Each edge
+    carries the best existing passage pair. Cheap: it composes the (cached)
+    related() payloads, so its invalidation follows related's index version."""
+    depth = 2 if int(depth or 1) >= 2 else 1
+    center = db.content_get(content_id)
+    if not center:
+        return {"center_id": content_id, "depth": depth, "nodes": [], "edges": []}
+
+    def _node(card: dict[str, Any], ring: int, score_to_center: float) -> dict[str, Any]:
+        return {
+            "content_id": card["id"],
+            "title": card.get("title") or "",
+            "thumbnail": card.get("thumbnail_url"),
+            "duration": card.get("duration_seconds"),
+            "channel": card.get("channel") or "",
+            "score_to_center": round(score_to_center, 4),
+            "ring": ring,
+        }
+
+    order: list[str] = [content_id]
+    node_of: dict[str, dict[str, Any]] = {content_id: _node(_content_card(content_id) or {"id": content_id}, 0, 1.0)}
+
+    d1 = related(content_id, limit=_MAP_MAX_D1)["results"]
+    for r in d1:
+        if r["id"] in node_of:
+            continue
+        node_of[r["id"]] = _node(r, 1, r["score"])
+        order.append(r["id"])
+
+    if depth == 2:
+        for r in d1:
+            if len(node_of) >= _MAP_MAX_TOTAL:
+                break
+            for rr in related(r["id"], limit=_MAP_MAX_D1)["results"]:
+                if len(node_of) >= _MAP_MAX_TOTAL:
+                    break
+                if rr["id"] in node_of or rr["score"] < _REL_MIN_SCORE:
+                    continue
+                # No direct centre score for a ring-2 node; use the score along
+                # the path that introduced it (parent link × neighbour score).
+                node_of[rr["id"]] = _node(rr, 2, rr["score"] * r["score"])
+                order.append(rr["id"])
+
+    ids = set(node_of)
+    # Edges: every related() link that lands on another node in the set, deduped
+    # on the unordered pair, keeping the highest-scoring orientation.
+    edges: dict[frozenset[str], dict[str, Any]] = {}
+    for x in ids:
+        for r in related(x, limit=_MAP_MAX_D1)["results"]:
+            y = r["id"]
+            if y not in ids:
+                continue
+            key = frozenset((x, y))
+            if len(key) < 2 or r["score"] < _REL_MIN_SCORE:
+                continue
+            prev = edges.get(key)
+            if prev is not None and prev["score"] >= r["score"]:
+                continue
+            p = r.get("pair") or {}
+            edges[key] = {
+                "a": x, "b": y, "score": round(r["score"], 4),
+                "pair": {
+                    "a_start_ms": p.get("a_start_ms"), "a_text": p.get("a_text"),
+                    "b_start_ms": p.get("b_start_ms"), "b_text": p.get("b_text"),
+                },
+            }
+
+    return {
+        "center_id": content_id,
+        "depth": depth,
+        "nodes": [node_of[i] for i in order],
+        "edges": list(edges.values()),
+    }
+
+
+def map_start() -> dict[str, Any]:
+    """The best default entry point for the Carte: the last-opened content if it
+    has links, else the most-connected content in the library. Bounded scan."""
+    # 1) Last opened (most recent seen_at) among indexed contents, if it links.
+    for cid in db.map_start_candidates(limit=1, seen_only=True):
+        if related(cid, limit=1)["results"]:
+            return {"content_id": cid}
+    # 2) Most connected among a bounded, recent set (cached related() keeps it cheap).
+    best_id, best_n = None, 0
+    for cid in db.map_start_candidates(limit=60):
+        n = len(related(cid, limit=_MAP_MAX_D1)["results"])
+        if n > best_n:
+            best_id, best_n = cid, n
+    return {"content_id": best_id}
 
 
 # --- search (hybrid, RRF) --------------------------------------------------

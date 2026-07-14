@@ -117,15 +117,23 @@ def _media_url(abspath: str | None) -> str | None:
 
 def to_public(row: dict[str, Any]) -> dict[str, Any]:
     """A content row as the API exposes it: adds thumbnail/stream URLs + whether
-    the file is still on disk, and normalizes the generation status."""
+    the file is still on disk, and normalizes the generation status.
+
+    `lifecycle` and (for a still-downloading row) `download_progress` let the card
+    show its enrichment step-chips (Téléchargement → Transcription → Résumé →
+    Indexé) without a second request."""
     d = dict(row)
-    d["thumbnail_url"] = _media_url(row.get("thumbnail_path"))
+    tp = row.get("thumbnail_path") or ""
+    # A pending capture keeps the remote preview thumbnail (no local file yet).
+    d["thumbnail_url"] = tp if tp.startswith("http") else _media_url(tp)
     d["stream_url"] = f"/api/library/{row['id']}/stream"
     fp = row.get("filepath")
     d["file_exists"] = bool(fp and Path(fp).exists())
     d["generation_status"] = row.get("generation_status") or "none"
+    d["lifecycle"] = row.get("lifecycle") or "ready"
     d["watch_later"] = bool(row.get("watch_later"))
     d["seen_at"] = row.get("seen_at")
+    d["download_progress"] = _download_progress(row)
     try:
         d["chapter_count"] = db.chapters_count(row["id"]) if row.get("id") else 0
     except Exception:  # noqa: BLE001
@@ -133,18 +141,74 @@ def to_public(row: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+def _download_progress(row: dict[str, Any]) -> float | None:
+    """Live percent of the download that is producing a still-pending row (read
+    from the in-memory job), or None once ready. Never raises."""
+    if (row.get("lifecycle") or "ready") != "pending":
+        return None
+    jid = row.get("job_id")
+    if not jid:
+        return 0.0
+    try:
+        from . import jobs as jobs_mod
+        job = jobs_mod.JOBS.get(jid)
+        return round(float(getattr(job, "current_percent", 0.0)), 1) if job else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 # --- Indexing from a fresh download ---------------------------------------
 def index_download(job: Any, result: Any) -> None:
-    """Create/upsert a content row per media file produced by a download."""
+    """Create/upsert a content row per media file produced by a download.
+
+    When the job had a 'pending' placeholder row (a manual capture), the first
+    file PROMOTES it in place — the card the user is already watching becomes
+    ready rather than a second row appearing. Otherwise (watch syncs, multi-file)
+    each file is upserted, and any stale pending row for the job is dropped."""
     watch_id = job.watch_id if getattr(job, "kind", "") == "watch" else None
-    for item in getattr(result, "items", None) or []:
-        fp = item.filepath
-        if not fp or not Path(fp).exists():
-            continue
+    job_id = getattr(job, "id", "") or ""
+    items = [
+        it for it in (getattr(result, "items", None) or [])
+        if it.filepath and Path(it.filepath).exists()
+    ]
+    pending = db.content_by_job(job_id) if job_id else None
+    if pending and pending.get("lifecycle") == "pending" and len(items) == 1:
+        try:
+            _promote_item(job_id, items[0], watch_id)
+            return
+        except Exception as exc:  # noqa: BLE001 — never fail the DL
+            print(f"[library] promote {items[0].filepath}: {exc}", flush=True)
+    if pending:
+        db.content_delete_pending(job_id)
+    for item in items:
         try:
             _index_item(item, watch_id, downloaded_at=time.time())
         except Exception as exc:  # noqa: BLE001 — library indexing never fails a DL
-            print(f"[library] index {fp}: {exc}", flush=True)
+            print(f"[library] index {item.filepath}: {exc}", flush=True)
+
+
+def _promote_item(job_id: str, item: Any, watch_id: str | None) -> None:
+    path = Path(item.filepath)
+    source = item.source or "youtube"
+    key = _thumb_key(source, item.id or "", str(path))
+    thumb = _store_thumb(path.with_suffix(".jpg"), item.thumbnail or "", key)
+    db.content_promote(job_id, {
+        "source": source,
+        "source_id": item.id or "",
+        "url": item.url or "",
+        "title": item.title or path.stem,
+        "description": item.description or "",
+        "channel": item.channel or path.parent.name,
+        "channel_url": item.channel_url or "",
+        "duration_seconds": item.duration,
+        "uploaded_at": item.uploaded_at or "",
+        "downloaded_at": time.time(),
+        "filepath": str(path),
+        "filesize": _safe_size(path),
+        "thumbnail_path": thumb,
+        "watch_id": watch_id,
+        "kind": _kind_for(path),
+    })
 
 
 def _index_item(item: Any, watch_id: str | None, downloaded_at: float) -> None:
@@ -171,6 +235,7 @@ def _index_item(item: Any, watch_id: str | None, downloaded_at: float) -> None:
         "kind": _kind_for(path),
         "transcript_status": "none",
         "index_status": "none",
+        "lifecycle": "ready",
     })
 
 
@@ -227,6 +292,7 @@ def _index_from_file(path: Path) -> None:
         "kind": _kind_for(path),
         "transcript_status": "none",
         "index_status": "none",
+        "lifecycle": "ready",
     })
 
 

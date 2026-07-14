@@ -5,6 +5,128 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.12] - 2026-07-14
+
+The **Carte** mode of Mémoire ships: a local, navigable, always-anchored view of
+the links between contents — the "focus" of a graph, not the "ball of nodes".
+Always centred on one content; hand-rolled radial layout (no graph lib, no
+physics); every link carries its passage pair.
+
+### Added — backend
+
+- **`GET /api/library/{id}/map?depth=1|2`** — a graph centred on `id`. depth 1 =
+  the focal node + its direct links (≤12, reusing `related`'s score floor);
+  depth 2 also adds links-of-links (≤25 nodes total, deduped, sorted by score).
+  Nodes `{content_id, title, thumbnail, duration, channel, score_to_center,
+  ring}`; edges `{a, b, score, pair:{a_start_ms, b_start_ms, a_text, b_text}}` —
+  the best existing passage pair. **Includes neighbour↔neighbour edges** above
+  the floor (what reveals clusters). Composes the (cached) `related()` payloads,
+  so its invalidation follows the same index version.
+- **`GET /api/library/map/start`** — the best default entry point: the
+  last-opened content if it has links, else the most-connected content
+  (bounded scan).
+- `related()` now caches the **full** top-N and slices to `limit` on read, so the
+  cache is limit-independent (the map needs more neighbours than the panel's 5).
+
+### Added — frontend
+
+- **Mémoire → Carte** (third view mode, previously disabled): a deterministic
+  radial layout — centre = focal content (round thumbnail), ring 1 = direct links
+  (node size ∝ score), ring 2 = links-of-links (depth toggle 1/2). Smooth CSS
+  transitions on entry and re-centre.
+- **Edge hover** → rich tooltip with the two passages ("Ici m:ss ↔ Là-bas m:ss",
+  2 lines each); clicking a timestamp opens the content at the exact second.
+  Edge thickness ∝ score.
+- **Node click** → side drawer (knowledge card: thumbnail, title, résumé court,
+  chaîne, **Ouvrir** / **Centrer la carte ici**) that also **lists the node's
+  links with their pairs** — the accessible, no-hover path to the same info.
+- **Centrer ici** re-fetches the map with a transition and feeds a **fil de
+  parcours** (breadcrumb) you can click to walk back through your memory.
+- **"Ouvrir la carte"** added to the content fiche ("Dans votre bibliothèque")
+  → Mémoire in Carte mode centred on that content.
+- **States**: no links → "Pas encore de connexions"; under-indexed library →
+  invite to transcribe/index with an indexed/total counter; mobile → depth 1
+  only, tooltips on tap.
+- **Accessibility**: nodes are focusable (Tab), Enter opens the drawer, arrow
+  keys move within/between rings; tooltip content is also reachable via the
+  drawer's link list.
+
+### Notes
+
+- No graph library (cytoscape/react-flow/d3) and no physics simulation — the
+  radial layout is computed and light. Never a whole-library constellation: the
+  map is always centred on a content. Only content nodes (entities arrive later).
+
+## [0.0.11] - 2026-07-14
+
+Reorganized around **your mental model** ("my memory"), not the pipeline
+("the downloader"). No feature was removed — everything moved, merged, or was
+demoted — plus three experience additions: omnipresent capture, progressive
+enrichment, and the staged first "aha". The plumbing is now consulted, not
+inhabited.
+
+### Changed — navigation
+
+- **New sidebar**: **Aujourd'hui · Mémoire · Sources · Réglages**. Downloads and
+  Explorer are gone from the nav. Old view ids and deep links (`?content=…&t=…`,
+  `?q=…`) still resolve — legacy ids are remapped, no dead links.
+- **Aujourd'hui** — the home and route `/`: the digest ("depuis votre dernière
+  visite", day→chaîne groups, tout marquer vu), **En écho à vos archives**,
+  Reprendre, À regarder plus tard. The nouveautés badge moved here from
+  Bibliothèque. First-run shows an onboarding CTA.
+- **Mémoire** — the full library: Contenus | Citations, grille/liste, tri,
+  filtres, processing indicators, plus a third **Carte** mode (present but
+  disabled with a "bientôt" tooltip — lands next).
+- **Sources** — the merger of Abonnements + Explorer. Source cards (the watches)
+  with a primary **Ajouter une source** action; the old catalogue browse becomes
+  a **Parcourir** tab inside the add dialog. All "YouTube" wording left the nav
+  and view titles.
+
+### Added — the activity tray
+
+- The top-bar "n actifs" indicator is now an **activity tray** button (badge =
+  downloads + transcriptions + générations + clips; amber dot when globally
+  paused, red dot on unseen errors; discreet when calm). It opens a side sheet
+  with compact per-queue sections (inline pause/reprise/annuler/réessayer),
+  Tout suspendre/reprendre, the restart-restoration banner, and **Historique
+  complet** → the full DownloadsView as a full-height sheet. **Opens itself only
+  on a new error**, never on ordinary progress.
+
+### Added — omnipresent capture
+
+- A global **+ (Ajouter)** button and the **⌘K palette** both reach the same
+  add-source dialog. The palette now navigates and acts (Aller à…, Ajouter une
+  source, Ouvrir l'activité, Tout suspendre) and turns a **pasted URL** into
+  "Capturer cette URL" (Enter = immediate capture). Pasting a URL **anywhere**
+  (outside inputs) offers a "Capturer {domaine} ?" toast.
+
+### Added — progressive enrichment (kills the "downloader feel")
+
+- A content row is now created the moment a capture is accepted, with a
+  `lifecycle` of `pending` → `ready` (`missing` preserved). The pipeline updates
+  that same row in place. A captured card appears in **Mémoire in seconds** and
+  enriches under your eyes: a chip row **Téléchargement → Transcription → Résumé
+  → Indexé**, each moving skeleton → ✓ (a failed step is clickable → tray).
+  Pending cards are excluded from the digest, search and feeds; visible only in
+  Mémoire. The content payload carries the consolidated `lifecycle`,
+  `download_progress`, `transcript_status`, `generation_status`, `index_status`
+  in one request (existing polling; no SSE).
+
+### Added — first "aha"
+
+- On the instance's **first finished transcript**, a one-time callout ("Votre
+  mémoire est prête — tapez trois mots entendus dans cette vidéo") appears on
+  Aujourd'hui and on the concerned content, with a button that opens ⌘K. It
+  retires for good on the first successful search or on close
+  (`first_transcript_celebrated`).
+
+### Notes
+
+- No new state manager, no SSE/WebSocket (existing polling). Backend concepts
+  (watches, jobs) keep their names — only the presentation changed.
+- A canceled/failed capture drops its pending card; extracted audio still
+  cascade-deletes with its content.
+
 ## [0.0.10] - 2026-07-13
 
 Listen anywhere. Each subscription can become a self-hosted **podcast RSS feed**

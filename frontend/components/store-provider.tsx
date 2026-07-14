@@ -21,6 +21,7 @@ import {
   type BackendJob,
   type BackendSettings,
   type BackendWatch,
+  type GenerationJob,
   type TranscriptJob,
 } from "@/lib/backend"
 import type { DownloadItem, DownloadStatus, Settings, Subscription } from "@/lib/types"
@@ -52,8 +53,18 @@ interface StoreValue {
   transcriptJobs: TranscriptJob[]
   transcriptActiveCount: number
   cancelTranscript: (id: string) => void
+  generationJobs: GenerationJob[]
+  generationActiveCount: number
+  cancelGeneration: (id: string) => void
+  // Sum of running/queued work across every queue (drives the activity tray badge).
+  activeTotal: number
+  // Failed items across every queue (drives the tray's red dot / auto-open).
+  errorCount: number
   totalSpeed: string
   addDownload: (options: StartDownloadOptions) => Promise<void>
+  /** One-gesture capture of a single URL (palette / paste / "+"): starts the
+   *  download with preview metadata so a card shows in Mémoire at once. */
+  capture: (url: string) => void
   pauseDownload: (id: string) => void
   resumeDownload: (id: string) => void
   cancelDownload: (id: string) => void
@@ -194,6 +205,7 @@ function watchToSub(w: BackendWatch, intervalHours: number): Subscription {
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [jobs, setJobs] = useState<BackendJob[]>([])
   const [transcriptJobs, setTranscriptJobs] = useState<TranscriptJob[]>([])
+  const [generationJobs, setGenerationJobs] = useState<GenerationJob[]>([])
   const [watches, setWatches] = useState<BackendWatch[]>([])
   const [bset, setBset] = useState<BackendSettings | null>(null)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
@@ -226,6 +238,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     () => backend.transcriptJobs().then(setTranscriptJobs).catch(() => {}),
     [],
   )
+  const refreshGenerations = useCallback(
+    () => backend.generationJobs().then(setGenerationJobs).catch(() => {}),
+    [],
+  )
   const refreshWatches = useCallback(() => backend.watches().then(setWatches).catch(() => {}), [])
   const refreshDigestCount = useCallback(
     () => backend.digestNewCount().then((r) => setDigestNewCount(r.count || 0)).catch(() => {}),
@@ -239,19 +255,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     backend.jobsRestored().then((r) => setRestoredCount(r.count || 0)).catch(() => {})
     refreshJobs()
     refreshTranscripts()
+    refreshGenerations()
     refreshWatches()
     refreshDigestCount()
     const t1 = setInterval(refreshJobs, 1500)
     const t2 = setInterval(refreshWatches, 8000)
     const t3 = setInterval(refreshTranscripts, 2000)
     const t4 = setInterval(refreshDigestCount, 60000)
+    const t5 = setInterval(refreshGenerations, 3000)
     return () => {
       clearInterval(t1)
       clearInterval(t2)
       clearInterval(t3)
       clearInterval(t4)
+      clearInterval(t5)
     }
-  }, [refreshJobs, refreshWatches, refreshTranscripts, refreshDigestCount])
+  }, [refreshJobs, refreshWatches, refreshTranscripts, refreshGenerations, refreshDigestCount])
 
   // Drop an optimistic override once the server's real status matches it (or the
   // job settled into a terminal state), so stale overrides never stick.
@@ -401,6 +420,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return total > 0 ? `${total.toFixed(1)} MB/s` : "0 MB/s"
   }, [jobs])
 
+  const transcriptActiveCount = useMemo(
+    () => transcriptJobs.filter((t) => t.status === "queued" || t.status === "running").length,
+    [transcriptJobs],
+  )
+  const generationActiveCount = useMemo(
+    () => generationJobs.filter((g) => g.status === "queued" || g.status === "running").length,
+    [generationJobs],
+  )
+  const activeTotal = activeCount + transcriptActiveCount + generationActiveCount
+  // Failures across every queue — the tray's red dot + auto-open trigger.
+  const errorCount = useMemo(
+    () =>
+      downloads.filter((d) => d.status === "failed").length +
+      transcriptJobs.filter((t) => t.status === "error").length +
+      generationJobs.filter((g) => g.status === "error").length,
+    [downloads, transcriptJobs, generationJobs],
+  )
+
   // --- download actions ---
   const addDownload = useCallback(
     async (options: StartDownloadOptions) => {
@@ -413,6 +450,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       refreshJobs()
     },
     [refreshJobs],
+  )
+
+  // One-gesture capture: start the download immediately with light preview
+  // metadata (a derived YouTube thumbnail when possible) so a 'pending' card
+  // shows in Mémoire in seconds and enriches in place.
+  const capture = useCallback(
+    (url: string) => {
+      const trimmed = url.trim()
+      if (!trimmed) return
+      const source = detectSource(trimmed)
+      addDownload({
+        url: trimmed,
+        title: "Capture en cours…",
+        thumbnail: youtubeThumb(trimmed),
+        quality: settings.defaultQuality,
+        format: settings.defaultFormat,
+        channel: source,
+      })
+    },
+    [addDownload, settings.defaultQuality, settings.defaultFormat],
+  )
+
+  const cancelGeneration = useCallback(
+    (id: string) => {
+      backend.cancelGenerationJob(id).then(refreshGenerations).catch(() => {})
+    },
+    [refreshGenerations],
   )
 
   const clearOverride = useCallback((id: string) => {
@@ -644,12 +708,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     refreshDigestCount,
     activeCount,
     transcriptJobs,
-    transcriptActiveCount: transcriptJobs.filter(
-      (t) => t.status === "queued" || t.status === "running",
-    ).length,
+    transcriptActiveCount,
     cancelTranscript,
+    generationJobs,
+    generationActiveCount,
+    cancelGeneration,
+    activeTotal,
+    errorCount,
     totalSpeed,
     addDownload,
+    capture,
     pauseDownload,
     resumeDownload,
     cancelDownload,

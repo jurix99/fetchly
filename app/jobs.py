@@ -167,6 +167,7 @@ def _delete_partials(job: Job) -> None:
 
 def _finalize_canceled(job: Job) -> None:
     _delete_partials(job)
+    db.content_delete_pending(job.id)  # drop the pending card (no file produced)
     job.status = "canceled"
     job.canceled_at = time.time()
     job.current_speed = ""
@@ -242,6 +243,7 @@ def run_job(job: Job) -> None:
         job.error = f"Espace disque insuffisant ({round(_disk_info()['free'] / _GB, 1)} Go libres)."
         job.finished_at = time.time()
         job.log.append(job.error)
+        db.content_delete_pending(job.id)
         _persist(job)
         _check_disk_alert()
         return
@@ -252,6 +254,7 @@ def run_job(job: Job) -> None:
         job.error = "Aucune source ne peut traiter cette URL."
         job.finished_at = time.time()
         job.log.append(job.error)
+        db.content_delete_pending(job.id)
         _persist(job)
         return
 
@@ -273,6 +276,7 @@ def run_job(job: Job) -> None:
         job.error = str(exc)
         job.finished_at = time.time()
         job.log.append(f"Error: {exc}")
+        db.content_delete_pending(job.id)
         _persist(job)
         return
 
@@ -348,7 +352,10 @@ def restored_state() -> dict[str, Any]:
 
 
 # --- High-level operations used by the routes ------------------------------
-def create_download(url: str, quality: str, fmt: str, subfolder: str, use_archive: bool) -> str:
+def create_download(
+    url: str, quality: str, fmt: str, subfolder: str, use_archive: bool,
+    meta: dict[str, Any] | None = None,
+) -> str:
     job = Job(
         id=str(uuid.uuid4()),
         url=url.strip(),
@@ -360,6 +367,14 @@ def create_download(url: str, quality: str, fmt: str, subfolder: str, use_archiv
     with JOBS_LOCK:
         JOBS[job.id] = job
     _persist(job)
+    # Progressive enrichment: a 'pending' content card appears in Mémoire the
+    # instant the capture is accepted (before the file exists), then the pipeline
+    # promotes it in place. Best-effort — never blocks the download.
+    if meta:
+        try:
+            db.content_create_pending(job.id, {**meta, "url": meta.get("url") or url.strip()})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[jobs] pending row for {job.id}: {exc}", flush=True)
     _prune_jobs()
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job.id

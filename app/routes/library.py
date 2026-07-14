@@ -68,6 +68,20 @@ async def get_chapters(content_id: str) -> JSONResponse:
     return JSONResponse({"content_id": content_id, "chapters": db.chapters_get(content_id)})
 
 
+@router.get("/api/library/map/start")
+async def map_start() -> JSONResponse:
+    """Best default entry point for the Carte (most-connected / last-opened)."""
+    return JSONResponse(indexer.map_start())
+
+
+@router.get("/api/library/{content_id}/map")
+async def content_map(content_id: str, depth: int = 1) -> JSONResponse:
+    """Radial exploration graph, always centred on this content. depth=1|2."""
+    if not db.content_get(content_id):
+        return JSONResponse({"error": "Contenu inconnu"}, status_code=404)
+    return JSONResponse(indexer.content_map(content_id, depth=2 if depth >= 2 else 1))
+
+
 @router.get("/api/library/{content_id}/related")
 async def related_content(content_id: str, limit: int = 5) -> JSONResponse:
     """Contents in the user's own library close to this one (the first crossing of

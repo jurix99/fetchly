@@ -417,6 +417,11 @@ def _transcribe(job: TJob, settings: dict[str, Any]) -> tuple[str, int, str]:
     _write_vtt(path.with_suffix(".vtt"), segs)
     db.segments_replace(job.content_id, segs)
     db.content_set_transcript(job.content_id, "done", language=detected)
+    # First "aha": remember when this instance produced its very first transcript
+    # (drives the one-time "Votre mémoire est prête" callout). Set once, ever.
+    if not db.meta_get("first_transcript_at"):
+        db.meta_set("first_transcript_at", str(time.time()))
+        db.meta_set("first_transcript_content", job.content_id)
     # Light monthly cost journal for the cloud engine (minutes only, no price).
     if settings.get("engine") == "cloud":
         minutes = (content.get("duration_seconds") or 0) / 60

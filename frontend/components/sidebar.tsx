@@ -1,26 +1,19 @@
 "use client"
 
-import {
-  CompassIcon,
-  DownloadIcon,
-  HomeIcon,
-  LibraryIcon,
-  RssIcon,
-  SettingsIcon,
-  ZapIcon,
-} from "lucide-react"
+import { LibraryIcon, RadioTowerIcon, SettingsIcon, SunriseIcon, ZapIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { useStore } from "@/components/store-provider"
 import type { View } from "@/components/app-shell"
 
-const NAV: { id: View; label: string; icon: typeof HomeIcon }[] = [
-  { id: "home", label: "Accueil", icon: HomeIcon },
-  { id: "library", label: "Bibliothèque", icon: LibraryIcon },
-  { id: "explorer", label: "Explorer", icon: CompassIcon },
-  { id: "subscriptions", label: "Abonnements", icon: RssIcon },
-  { id: "downloads", label: "Téléchargements", icon: DownloadIcon },
+/** The mental model, not the pipeline: Aujourd'hui (what's new) → Mémoire (all I
+ *  kept) → Sources (what feeds it) → Réglages. Downloads/Explorer are gone from
+ *  the nav — the plumbing lives in the activity tray and the add-source dialog. */
+const NAV: { id: View; label: string; icon: typeof SunriseIcon }[] = [
+  { id: "today", label: "Aujourd'hui", icon: SunriseIcon },
+  { id: "memory", label: "Mémoire", icon: LibraryIcon },
+  { id: "sources", label: "Sources", icon: RadioTowerIcon },
   { id: "settings", label: "Réglages", icon: SettingsIcon },
 ]
 
@@ -31,7 +24,7 @@ export function Sidebar({
   active: View
   onNavigate: (v: View) => void
 }) {
-  const { activeCount, subscriptions, digestNewCount } = useStore()
+  const { subscriptions, digestNewCount } = useStore()
   const activeSubs = subscriptions.filter((s) => s.active).length
 
   return (
@@ -67,12 +60,8 @@ export function Sidebar({
             >
               <Icon className="size-4 shrink-0" />
               <span className="flex-1 text-left">{item.label}</span>
-              {item.id === "downloads" && activeCount > 0 && (
-                <Badge className="bg-info/20 text-info border-info/30 text-[10px]">
-                  {activeCount}
-                </Badge>
-              )}
-              {item.id === "library" && digestNewCount > 0 && (
+              {/* Nouveautés badge lives on Aujourd'hui now (moved from Bibliothèque). */}
+              {item.id === "today" && digestNewCount > 0 && (
                 <Badge className="border-primary/30 bg-primary/20 text-[10px] text-primary">
                   {digestNewCount > 99 ? "99+" : digestNewCount}
                 </Badge>
@@ -84,10 +73,8 @@ export function Sidebar({
 
       <div className="border-t border-sidebar-border p-3">
         <div className="rounded-lg border border-sidebar-border bg-card/50 p-3">
-          <p className="text-xs font-medium">Abonnements actifs</p>
-          <p className="mt-1 text-2xl font-semibold tabular-nums">
-            {activeSubs}
-          </p>
+          <p className="text-xs font-medium">Sources actives</p>
+          <p className="mt-1 text-2xl font-semibold tabular-nums">{activeSubs}</p>
           <p className="text-[11px] text-muted-foreground">
             surveillance automatique des nouvelles vidéos
           </p>

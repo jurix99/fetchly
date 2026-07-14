@@ -24,12 +24,25 @@ async def start_download(req: DownloadRequest) -> JSONResponse:
             status_code=507,
         )
     quality = req.quality or store.get_settings()["default_quality"]
+    # Extraction metadata (if the client sent a preview) seeds a 'pending' content
+    # card so it appears in Mémoire immediately.
+    meta = None
+    if req.title or req.thumbnail or req.channel:
+        meta = {
+            "title": req.title,
+            "thumbnail_path": req.thumbnail,
+            "channel": req.channel,
+            "duration_seconds": req.duration_seconds,
+            "source": req.source,
+            "url": req.url.strip(),
+        }
     job_id = jobs.create_download(
         req.url,
         quality,
         req.format or "MP4",
         req.subfolder,
         use_archive=bool(store.get_settings().get("download_archive", False)),
+        meta=meta,
     )
     return JSONResponse({"job_id": job_id})
 
